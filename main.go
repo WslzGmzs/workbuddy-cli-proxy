@@ -311,17 +311,22 @@ func wbRegistration() registration {
 }
 
 func wbModels() []pluginapi.ModelInfo {
-	specs := []struct{ id, name string }{
-		{"glm-5.2", "GLM-5.2"},
-		{"glm-5.1", "GLM-5.1"},
-		{"glm-5v-turbo", "GLM-5V Turbo"},
-		{"kimi-k2.7", "Kimi K2.7"},
-		{"minimax-m3-pay", "MiniMax M3"},
-		{"hy3", "Hy3"},
-		{"hy3-preview", "Hy3 Preview"},
-		{"hy3-preview-agent", "Hy3 Preview Agent"},
-		{"deepseek-v4-pro", "DeepSeek V4 Pro"},
-		{"deepseek-v4-flash", "DeepSeek V4 Flash"},
+	const maxCompletionTokens int64 = 8192
+	specs := []struct {
+		id            string
+		name          string
+		contextLength int64
+	}{
+		{"glm-5.2", "GLM-5.2", 1000000},
+		{"glm-5.1", "GLM-5.1", 131072},
+		{"glm-5v-turbo", "GLM-5V Turbo", 131072},
+		{"kimi-k2.7", "Kimi K2.7", 262144},
+		{"minimax-m3-pay", "MiniMax M3", 204800},
+		{"hy3", "Hy3", 262144},
+		{"hy3-preview", "Hy3 Preview", 262144},
+		{"hy3-preview-agent", "Hy3 Preview Agent", 262144},
+		{"deepseek-v4-pro", "DeepSeek V4 Pro", 1000000},
+		{"deepseek-v4-flash", "DeepSeek V4 Flash", 1000000},
 	}
 	models := make([]pluginapi.ModelInfo, 0, len(specs))
 	for _, m := range specs {
@@ -332,8 +337,8 @@ func wbModels() []pluginapi.ModelInfo {
 			DisplayName:                m.name,
 			Name:                       m.id,
 			SupportedGenerationMethods: []string{"chat"},
-			ContextLength:              128000,
-			MaxCompletionTokens:        8192,
+			ContextLength:              m.contextLength,
+			MaxCompletionTokens:        maxCompletionTokens,
 			UserDefined:                true,
 		})
 	}
