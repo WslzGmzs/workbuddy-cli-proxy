@@ -42,6 +42,15 @@ typedef struct {
 	cliproxy_plugin_shutdown_fn shutdown;
 } cliproxy_plugin_api;
 
+// Wrappers so Go can invoke the host function-pointer table via cgo. The host
+// API captured at init is used to push streaming chunks back asynchronously.
+static int wb_call_host(cliproxy_host_api* api, const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
+	return api->call(api->host_ctx, method, request, request_len, response);
+}
+static void wb_free_host_buffer(cliproxy_host_api* api, void* ptr, size_t len) {
+	api->free_buffer(ptr, len);
+}
+
 extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
 extern void cliproxyPluginFree(void*, size_t);
 extern void cliproxyPluginShutdown(void);
@@ -90,7 +99,8 @@ type loginCtx struct {
 }
 
 var (
-	loginStates    sync.Map // state(string) -> *loginCtx
+	hostAPI        *C.cliproxy_host_api // captured at init, used for async host calls
+	loginStates    sync.Map             // state(string) -> *loginCtx
 	httpClientOnce sync.Once
 	sharedClient   *http.Client
 )
@@ -106,6 +116,7 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if plugin == nil {
 		return 1
 	}
+	hostAPI = host
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
@@ -145,6 +156,69 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {}
+
+// -----------------------------------------------------------------------------
+// Host calls (async streaming)
+// -----------------------------------------------------------------------------
+
+// hostCall invokes a host RPC method via the function-pointer table captured
+// at init. Used to push stream chunks back asynchronously (host.stream.emit /
+// host.stream.close).
+func hostCall(method string, request []byte) ([]byte, error) {
+	if hostAPI == nil || hostAPI.call == nil {
+		return nil, fmt.Errorf("host API unavailable")
+	}
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+	var cReq unsafe.Pointer
+	var reqLen C.size_t
+	if len(request) > 0 {
+		cReq = C.CBytes(request)
+		defer C.free(cReq)
+		reqLen = C.size_t(len(request))
+	}
+	var resp C.cliproxy_buffer
+	rc := C.wb_call_host(hostAPI, cMethod, (*C.uint8_t)(cReq), reqLen, &resp)
+	var out []byte
+	if resp.ptr != nil && resp.len > 0 {
+		out = C.GoBytes(resp.ptr, C.int(resp.len))
+	}
+	if resp.ptr != nil && hostAPI.free_buffer != nil {
+		C.wb_free_host_buffer(hostAPI, resp.ptr, resp.len)
+	}
+	if rc != 0 {
+		return out, fmt.Errorf("host call %s returned %d", method, int(rc))
+	}
+	return out, nil
+}
+
+// streamEmit pushes one chunk payload to the host stream. Returns an error if
+// the host rejected it (e.g. the client already disconnected and the stream
+// was closed), which the pump uses to stop reading a dead upstream.
+func streamEmit(streamID string, payload []byte) error {
+	if streamID == "" {
+		return fmt.Errorf("no stream id")
+	}
+	body, _ := json.Marshal(map[string]any{"stream_id": streamID, "payload": payload})
+	_, err := hostCall(pluginabi.MethodHostStreamEmit, body)
+	return err
+}
+
+func streamEmitError(streamID, message string) {
+	if streamID == "" {
+		return
+	}
+	errJSON, _ := json.Marshal(map[string]any{"error": map[string]any{"message": message}})
+	_ = streamEmit(streamID, errJSON)
+}
+
+func streamClose(streamID string) {
+	if streamID == "" {
+		return
+	}
+	body, _ := json.Marshal(map[string]any{"stream_id": streamID})
+	_, _ = hostCall(pluginabi.MethodHostStreamClose, body)
+}
 
 // -----------------------------------------------------------------------------
 // RPC dispatch
@@ -627,8 +701,16 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 }
 
+// executorStreamRequest wraps the host's executor.execute_stream RPC: the
+// ExecutorRequest plus the async stream id the host uses to receive chunks.
+type executorStreamRequest struct {
+	pluginapi.ExecutorRequest
+	StreamID       string `json:"stream_id,omitempty"`
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
 func handleExecStream(raw []byte) ([]byte, error) {
-	var req pluginapi.ExecutorRequest
+	var req executorStreamRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -641,6 +723,82 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		body = req.OriginalRequest
 	}
 	body = rewriteSystemForUpstream(body)
+
+	headers := streamHeaders()
+	sseFramed := clientNeedsSSEFrame(req.Metadata)
+
+	// No async stream id → fall back to synchronous chunk collection.
+	if req.StreamID == "" {
+		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
+		if errCollect != nil {
+			return nil, errCollect
+		}
+		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
+	}
+
+	// Async: return immediately with empty chunks. A goroutine pumps the upstream
+	// and emits each chunk via host.stream.emit so the client sees true streaming.
+	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+	if err != nil {
+		streamEmitError(req.StreamID, err.Error())
+		streamClose(req.StreamID)
+		return okEnvelope(streamResponse{Headers: headers})
+	}
+	backendHeaders(httpReq, sa)
+	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	return okEnvelope(streamResponse{Headers: headers})
+}
+
+func streamHeaders() http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("X-Accel-Buffering", "no")
+	return h
+}
+
+// pumpUpstreamStream reads the upstream SSE response in the background and
+// emits each cleaned chunk to the host stream. It closes the stream when done.
+// An emit failure (client disconnected → host closed the stream) aborts the
+// pump so we stop reading a dead upstream.
+func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
+	resp, err := sharedHTTPClient().Do(httpReq)
+	if err != nil {
+		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
+		streamClose(streamID)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		errPayload, _ := io.ReadAll(resp.Body)
+		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
+		streamClose(streamID)
+		return
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	for scanner.Scan() {
+		content := stripDataPrefix(scanner.Text())
+		if content == "" || content == "[DONE]" {
+			continue
+		}
+		cleaned := cleanChunkJSON(content)
+		if cleaned == "" {
+			continue
+		}
+		if sseFramed {
+			cleaned = "data: " + cleaned
+		}
+		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
+			break
+		}
+	}
+	streamClose(streamID)
+}
+
+// collectUpstreamStream is the synchronous fallback (no async stream id): drain
+// the upstream, clean each chunk, return them as a slice.
+func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -651,22 +809,11 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
 	defer resp.Body.Close()
-
-	headers := http.Header{}
-	headers.Set("Content-Type", "text/event-stream")
-	headers.Set("Cache-Control", "no-cache")
-	headers.Set("X-Accel-Buffering", "no")
-
 	if resp.StatusCode >= 400 {
 		errPayload, _ := io.ReadAll(resp.Body)
-		errJSON, _ := json.Marshal(map[string]any{"error": map[string]any{
-			"message": fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)),
-		}})
-		return okEnvelope(streamResponse{Headers: headers, Chunks: []pluginapi.ExecutorStreamChunk{{Payload: errJSON}}})
+		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
 	}
-
-	chunks := aggregateSSE(resp.Body, clientNeedsSSEFrame(req.Metadata))
-	return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
+	return aggregateSSE(resp.Body, sseFramed), nil
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
