@@ -243,6 +243,8 @@ func wbModels() []pluginapi.ModelInfo {
 		{"glm-5v-turbo", "GLM-5V Turbo"},
 		{"kimi-k2.7", "Kimi K2.7"},
 		{"minimax-m3-pay", "MiniMax M3"},
+		{"hy3", "Hy3"},
+		{"hy3-preview", "Hy3 Preview"},
 		{"hy3-preview-agent", "Hy3 Preview Agent"},
 		{"deepseek-v4-pro", "DeepSeek V4 Pro"},
 		{"deepseek-v4-flash", "DeepSeek V4 Flash"},

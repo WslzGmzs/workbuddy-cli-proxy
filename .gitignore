@@ -4,6 +4,9 @@
 *.dll
 *.h
 
+# 凭据(含 access/refresh token,切勿提交)
+workbuddy.json
+
 # Go
 /vendor/
 
