@@ -68,6 +68,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -78,7 +79,8 @@ import (
 )
 
 // pluginVersion is injected at link time for release builds:
-//   -ldflags "-X main.pluginVersion=0.2.0"
+//
+//	-ldflags "-X main.pluginVersion=0.2.0"
 var pluginVersion = "0.2.0"
 
 const (
@@ -255,6 +257,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleExecExecute(request)
 	case pluginabi.MethodExecutorExecuteStream:
 		return handleExecStream(request)
+	case pluginabi.MethodManagementRegister:
+		return okEnvelope(wbManagementRegistration())
+	case pluginabi.MethodManagementHandle:
+		return handleManagement(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -292,6 +298,7 @@ type registrationCapability struct {
 	ExecutorModelScope    pluginapi.ExecutorModelScope `json:"executor_model_scope"`
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
+	ManagementAPI         bool                         `json:"management_api"`
 }
 
 type streamResponse struct {
@@ -315,6 +322,7 @@ func wbRegistration() registration {
 			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
+			ManagementAPI:         true,
 		},
 	}
 }
@@ -369,6 +377,10 @@ func wbModels() []pluginapi.ModelInfo {
 //	{"type":"workbuddy","auth_type":"api_key","api_key":"...","user_id":"anonymous","domain":"copilot.tencent.com"}
 //	{"type":"workbuddy","apiKey":"..."}
 //	{"auth":{"accessToken":"...","refreshToken":"..."},"account":{...}}  // legacy oauth
+//
+// Standard CPA credential fields (same root keys as host synthesizer / panel PATCH):
+//
+//	"prefix": "wb", "proxy_url": "http://127.0.0.1:7890", "priority": 100
 type storedAuth struct {
 	Type         string        `json:"type,omitempty"`
 	AuthType     string        `json:"auth_type,omitempty"`
@@ -378,9 +390,66 @@ type storedAuth struct {
 	Domain       string        `json:"domain,omitempty"`
 	Endpoint     string        `json:"endpoint,omitempty"`
 	EnterpriseID string        `json:"enterprise_id,omitempty"`
+	Prefix       string        `json:"prefix,omitempty"`
+	ProxyURL     string        `json:"proxy_url,omitempty"`
+	Priority     flexInt       `json:"priority,omitempty"`
 	Auth         storedTokens  `json:"auth"`
 	Account      storedAccount `json:"account"`
 }
+
+// flexInt accepts CPA priority as number or string (panel/synthesizer both appear).
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		*f = 0
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			*f = 0
+			return nil
+		}
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return fmt.Errorf("priority: %w", err)
+		}
+		*f = flexInt(n)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err == nil {
+		i, errInt := n.Int64()
+		if errInt != nil {
+			f64, errF := n.Float64()
+			if errF != nil {
+				return errInt
+			}
+			*f = flexInt(int(f64))
+			return nil
+		}
+		*f = flexInt(int(i))
+		return nil
+	}
+	var i int
+	if err := json.Unmarshal(b, &i); err != nil {
+		return err
+	}
+	*f = flexInt(i)
+	return nil
+}
+
+func (f flexInt) MarshalJSON() ([]byte, error) {
+	return json.Marshal(int(f))
+}
+
+func (f flexInt) Int() int { return int(f) }
 
 type storedTokens struct {
 	AccessToken  string `json:"accessToken"`
@@ -465,6 +534,9 @@ func normalizeStored(sa *storedAuth) {
 	sa.Domain = strings.TrimSpace(sa.Domain)
 	sa.Endpoint = strings.TrimSpace(sa.Endpoint)
 	sa.EnterpriseID = strings.TrimSpace(sa.EnterpriseID)
+	sa.ProxyURL = strings.TrimSpace(sa.ProxyURL)
+	// CPA prefix: single path segment, no slashes (matches host synthesizer).
+	sa.Prefix = normalizeAuthPrefix(sa.Prefix)
 
 	// Infer api_key mode when the key is present but auth_type was omitted.
 	if sa.AuthType == "" && sa.APIKey != "" && sa.Auth.AccessToken == "" {
@@ -500,6 +572,71 @@ func normalizeStored(sa *storedAuth) {
 		if sa.Auth.Domain == "" {
 			sa.Auth.Domain = sa.Domain
 		}
+	}
+}
+
+func normalizeAuthPrefix(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	prefix = strings.Trim(prefix, "/")
+	if prefix == "" || strings.Contains(prefix, "/") {
+		return ""
+	}
+	return prefix
+}
+
+// applyHostCredentialFields copies CPA host-managed credential fields from
+// refresh/parse metadata when storage JSON omitted them (panel PATCH often
+// updates metadata without rewriting plugin storage).
+func applyHostCredentialFields(sa *storedAuth, metadata map[string]any, attributes map[string]string) {
+	if sa == nil {
+		return
+	}
+	if metadata != nil {
+		if sa.Prefix == "" {
+			if v, ok := metadata["prefix"].(string); ok {
+				sa.Prefix = normalizeAuthPrefix(v)
+			}
+		}
+		if sa.ProxyURL == "" {
+			if v, ok := metadata["proxy_url"].(string); ok {
+				sa.ProxyURL = strings.TrimSpace(v)
+			}
+		}
+		if sa.Priority.Int() == 0 {
+			if n, ok := anyToInt(metadata["priority"]); ok {
+				sa.Priority = flexInt(n)
+			}
+		}
+	}
+	if attributes != nil && sa.Priority.Int() == 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(attributes["priority"])); err == nil {
+			sa.Priority = flexInt(n)
+		}
+	}
+}
+
+func anyToInt(v any) (int, bool) {
+	switch t := v.(type) {
+	case int:
+		return t, true
+	case int64:
+		return int(t), true
+	case float64:
+		return int(t), true
+	case json.Number:
+		i, err := t.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(i), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(t))
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
 	}
 }
 
@@ -588,6 +725,7 @@ func sharedHTTPClient() *http.Client {
 		sharedClient = &http.Client{
 			Timeout: 120 * time.Second,
 			Transport: &http.Transport{
+				Proxy:               http.ProxyFromEnvironment,
 				MaxIdleConns:        20,
 				IdleConnTimeout:     90 * time.Second,
 				MaxIdleConnsPerHost: 5,
@@ -598,14 +736,40 @@ func sharedHTTPClient() *http.Client {
 	return sharedClient
 }
 
+// httpClientForAuth returns a client that honors the credential proxy_url when set.
+// Login QR flow always uses the isolated cookie client (no per-auth proxy required).
+func httpClientForAuth(sa *storedAuth) *http.Client {
+	if sa == nil || strings.TrimSpace(sa.ProxyURL) == "" {
+		return sharedHTTPClient()
+	}
+	proxyURL, err := url.Parse(strings.TrimSpace(sa.ProxyURL))
+	if err != nil || proxyURL.Scheme == "" || proxyURL.Host == "" {
+		return sharedHTTPClient()
+	}
+	return &http.Client{
+		Timeout: 120 * time.Second,
+		Transport: &http.Transport{
+			Proxy:               http.ProxyURL(proxyURL),
+			MaxIdleConns:        20,
+			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConnsPerHost: 5,
+		},
+	}
+}
+
 // newLoginClient builds an isolated client with its own cookie jar so that the
 // browser login for one state can never leak into another.
 func newLoginClient() *http.Client {
 	jar, _ := cookiejar.New(nil)
 	return &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: sharedHTTPClient().Transport,
-		Jar:       jar,
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
+			MaxIdleConns:        20,
+			IdleConnTimeout:     90 * time.Second,
+			MaxIdleConnsPerHost: 5,
+		},
+		Jar: jar,
 	}
 }
 
@@ -724,6 +888,11 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 		// Not a workbuddy credential; let the host try other providers.
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
+	// RawJSON is the full auth file; fields already on sa. Keep helpers for
+	// partial shapes where only metadata carries CPA credential fields.
+	applyHostCredentialFields(sa, nil, nil)
+	// Also accept top-level fields that unmarshal into storedAuth via RawJSON.
+	// If file had prefix/proxy_url/priority, parseStored already loaded them.
 	fileName := strings.TrimSpace(req.FileName)
 	if fileName == "" {
 		fileName = authFileName
@@ -745,10 +914,20 @@ func toAuthData(sa *storedAuth, fileName string) pluginapi.AuthData {
 		// Keep only api_key fields on disk for key mode (drop empty oauth noise).
 		persist.Auth = storedTokens{Domain: persist.Domain}
 	}
+	// Storage JSON includes CPA standard fields so panel PATCH + re-parse round-trip.
 	storage, _ := json.Marshal(persist)
 	meta := map[string]any{
 		"type":      providerName,
 		"auth_type": persist.authMode(),
+	}
+	if persist.Prefix != "" {
+		meta["prefix"] = persist.Prefix
+	}
+	if persist.ProxyURL != "" {
+		meta["proxy_url"] = persist.ProxyURL
+	}
+	if persist.Priority.Int() != 0 {
+		meta["priority"] = persist.Priority.Int()
 	}
 	if persist.isAPIKey() {
 		meta["api_key"] = true
@@ -769,13 +948,20 @@ func toAuthData(sa *storedAuth, fileName string) pluginapi.AuthData {
 			meta["domain"] = persist.Auth.Domain
 		}
 	}
+	attrs := map[string]string{}
+	if persist.Priority.Int() != 0 {
+		attrs["priority"] = strconv.Itoa(persist.Priority.Int())
+	}
 	return pluginapi.AuthData{
 		Provider:    providerName,
 		ID:          sa.authID(),
 		FileName:    fileName,
 		Label:       sa.label(),
+		Prefix:      persist.Prefix,
+		ProxyURL:    persist.ProxyURL,
 		StorageJSON: storage,
 		Metadata:    meta,
+		Attributes:  attrs,
 	}
 }
 
@@ -1059,6 +1245,10 @@ func classifyPastedCredential(pasted string) (kind, value string, err error) {
 		}
 	}
 
+	// CPA management UI may paste only the key into "redirect_url" without
+	// building a real URL. Host still requires state+code fields separately.
+	// When code arrives as a bare key (correct client), accept it here.
+
 	lower := strings.ToLower(pasted)
 	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
 		u, errParse := url.Parse(pasted)
@@ -1119,6 +1309,11 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
+	// Preserve host panel fields (prefix / proxy_url / priority) across refresh.
+	applyHostCredentialFields(sa, req.Metadata, req.Attributes)
+	if p := strings.TrimSpace(req.Attributes["proxy_url"]); p != "" && sa.ProxyURL == "" {
+		sa.ProxyURL = p
+	}
 	// API keys do not rotate; return the same credential unchanged.
 	if sa.isAPIKey() {
 		return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa, authFileName)})
@@ -1134,7 +1329,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		}
 		r.Header.Set("X-Auth-Refresh-Source", providerName)
 	}
-	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, nil)
+	data, status, err := doJSON(httpClientForAuth(sa), http.MethodPost, endpointTokenRefresh, headers, nil)
 	if err != nil {
 		if status >= 400 {
 			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
@@ -1177,7 +1372,7 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
+	resp, err := httpClientForAuth(sa).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
@@ -1237,7 +1432,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		return okEnvelope(streamResponse{Headers: headers})
 	}
 	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	go pumpUpstreamStream(httpClientForAuth(sa), httpReq, req.StreamID, sseFramed)
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -1253,8 +1448,11 @@ func streamHeaders() http.Header {
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := sharedHTTPClient().Do(httpReq)
+func pumpUpstreamStream(client *http.Client, httpReq *http.Request, streamID string, sseFramed bool) {
+	if client == nil {
+		client = sharedHTTPClient()
+	}
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
 		streamClose(streamID)
@@ -1296,7 +1494,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]plugi
 		return nil, err
 	}
 	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
+	resp, err := httpClientForAuth(sa).Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
@@ -1611,6 +1809,292 @@ func stripDataPrefix(s string) string {
 	}
 	return s
 }
+
+// -----------------------------------------------------------------------------
+// Management API (add API key without OAuth paste box)
+// -----------------------------------------------------------------------------
+//
+// CPA's management UI posts paste-box values as oauth-callback with only
+// redirect_url set (no state/code). Host rejects that before the plugin runs.
+// These routes give a reliable path: authenticated POST + host.auth.save.
+
+type managementRegResponse struct {
+	Routes    []managementRouteJSON    `json:"routes,omitempty"`
+	Resources []managementResourceJSON `json:"resources,omitempty"`
+}
+
+type managementRouteJSON struct {
+	Method string `json:"Method"`
+	Path   string `json:"Path"`
+}
+
+type managementResourceJSON struct {
+	Path        string `json:"Path"`
+	Menu        string `json:"Menu"`
+	Description string `json:"Description"`
+}
+
+type managementHandleRequest struct {
+	Method  string              `json:"Method"`
+	Path    string              `json:"Path"`
+	Headers map[string][]string `json:"Headers"`
+	Query   map[string][]string `json:"Query"`
+	Body    []byte              `json:"Body"`
+}
+
+type managementHandleResponse struct {
+	StatusCode int                 `json:"StatusCode"`
+	Headers    map[string][]string `json:"Headers,omitempty"`
+	Body       []byte              `json:"Body"`
+}
+
+func wbManagementRegistration() managementRegResponse {
+	return managementRegResponse{
+		// Authenticated management API (needs management Bearer token).
+		Routes: []managementRouteJSON{
+			{Method: "POST", Path: "/workbuddy/api-key"},
+			{Method: "GET", Path: "/workbuddy/api-key"},
+		},
+		// Browser menu under /v0/resource/plugins/workbuddy/...
+		Resources: []managementResourceJSON{
+			{
+				Path:        "/api-key",
+				Menu:        "WorkBuddy API Key",
+				Description: "Add a CodeBuddy API key without using the OAuth paste box.",
+			},
+		},
+	}
+}
+
+func handleManagement(raw []byte) ([]byte, error) {
+	var req managementHandleRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, err
+	}
+	method := strings.ToUpper(strings.TrimSpace(req.Method))
+	path := strings.TrimSpace(req.Path)
+
+	switch {
+	case method == "GET" && strings.HasSuffix(path, "/api-key") && strings.Contains(path, "/resource/plugins/"+providerName):
+		return okEnvelope(managementHTMLResponse())
+	case method == "GET" && (path == "/v0/management/workbuddy/api-key" || strings.HasSuffix(path, "/workbuddy/api-key")):
+		// Simple health / help for the API endpoint.
+		body, _ := json.Marshal(map[string]any{
+			"provider": providerName,
+			"usage":    "POST /v0/management/workbuddy/api-key with JSON {\"api_key\":\"...\"}",
+			"note":     "Do not use oauth-callback redirect_url for API keys; host requires state+code.",
+		})
+		return okEnvelope(managementHandleResponse{
+			StatusCode: 200,
+			Headers:    map[string][]string{"Content-Type": {"application/json"}},
+			Body:       body,
+		})
+	case method == "POST" && (path == "/v0/management/workbuddy/api-key" || strings.HasSuffix(path, "/workbuddy/api-key")):
+		return handleSaveAPIKey(req.Body)
+	default:
+		return okEnvelope(managementHandleResponse{
+			StatusCode: 404,
+			Headers:    map[string][]string{"Content-Type": {"application/json"}},
+			Body:       []byte(`{"error":"not found"}`),
+		})
+	}
+}
+
+func managementHTMLResponse() managementHandleResponse {
+	return managementHandleResponse{
+		StatusCode: 200,
+		Headers:    map[string][]string{"Content-Type": {"text/html; charset=utf-8"}},
+		Body:       []byte(apiKeyPageHTML),
+	}
+}
+
+func handleSaveAPIKey(body []byte) ([]byte, error) {
+	var payload struct {
+		APIKey       string  `json:"api_key"`
+		APIKeyCamel  string  `json:"apiKey"`
+		Key          string  `json:"key"`
+		UserID       string  `json:"user_id"`
+		Domain       string  `json:"domain"`
+		EnterpriseID string  `json:"enterprise_id"`
+		Prefix       string  `json:"prefix"`
+		ProxyURL     string  `json:"proxy_url"`
+		Priority     flexInt `json:"priority"`
+	}
+	// Allow raw text body as the key itself.
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed != "" && !strings.HasPrefix(trimmed, "{") {
+		payload.APIKey = trimmed
+	} else if err := json.Unmarshal(body, &payload); err != nil {
+		return okEnvelope(managementHandleResponse{
+			StatusCode: 400,
+			Headers:    map[string][]string{"Content-Type": {"application/json"}},
+			Body:       []byte(`{"error":"invalid json; expected {\"api_key\":\"...\"}"}`),
+		})
+	}
+	key := strings.TrimSpace(firstNonEmpty(payload.APIKey, payload.APIKeyCamel, payload.Key))
+	if !looksLikeAPIKey(key) {
+		return okEnvelope(managementHandleResponse{
+			StatusCode: 400,
+			Headers:    map[string][]string{"Content-Type": {"application/json"}},
+			Body:       []byte(`{"error":"api_key missing or invalid"}`),
+		})
+	}
+	sa := &storedAuth{
+		Type:         providerName,
+		AuthType:     authTypeAPIKey,
+		APIKey:       key,
+		UserID:       firstNonEmpty(strings.TrimSpace(payload.UserID), "anonymous"),
+		Domain:       firstNonEmpty(strings.TrimSpace(payload.Domain), "copilot.tencent.com"),
+		EnterpriseID: strings.TrimSpace(payload.EnterpriseID),
+		Prefix:       payload.Prefix,
+		ProxyURL:     payload.ProxyURL,
+		Priority:     payload.Priority,
+	}
+	normalizeStored(sa)
+	fileName := sa.authID() + ".json"
+	// Persist full CPA-compatible auth file (type + standard fields at root).
+	storage, err := json.Marshal(sa)
+	if err != nil {
+		return nil, err
+	}
+	saveReq, _ := json.Marshal(map[string]any{
+		"name": fileName,
+		"json": json.RawMessage(storage),
+	})
+	if _, err := hostCall(pluginabi.MethodHostAuthSave, saveReq); err != nil {
+		// Fall back: if host.auth.save unavailable, return the JSON for manual upload.
+		msg, _ := json.Marshal(map[string]any{
+			"error":    "host.auth.save failed: " + err.Error(),
+			"hint":     "Upload this JSON via Auth Files, or fix host callback support",
+			"fileName": fileName,
+			"auth":     json.RawMessage(storage),
+		})
+		return okEnvelope(managementHandleResponse{
+			StatusCode: 502,
+			Headers:    map[string][]string{"Content-Type": {"application/json"}},
+			Body:       msg,
+		})
+	}
+	out, _ := json.Marshal(map[string]any{
+		"status":    "ok",
+		"provider":  providerName,
+		"fileName":  fileName,
+		"id":        sa.authID(),
+		"label":     sa.label(),
+		"prefix":    sa.Prefix,
+		"proxy_url": sa.ProxyURL,
+		"priority":  sa.Priority.Int(),
+	})
+	return okEnvelope(managementHandleResponse{
+		StatusCode: 200,
+		Headers:    map[string][]string{"Content-Type": {"application/json"}},
+		Body:       out,
+	})
+}
+
+// apiKeyPageHTML is served at /v0/resource/plugins/workbuddy/api-key
+// (management menu: "WorkBuddy API Key"). Uses same-origin fetch with the
+// management token from the parent management UI when available.
+const apiKeyPageHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WorkBuddy API Key</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #111; background: #f4f4f5; }
+    body { max-width: 560px; margin: 32px auto; padding: 0 16px; }
+    .card { background: #fff; border: 1px solid #e4e4e7; border-radius: 10px; padding: 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    p, li { font-size: 13px; color: #52525b; line-height: 1.5; }
+    label { display: block; font-size: 12px; font-weight: 600; margin: 14px 0 6px; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #d4d4d8; border-radius: 6px; font: inherit; }
+    textarea { min-height: 88px; font-family: ui-monospace, monospace; font-size: 12px; }
+    button { margin-top: 14px; padding: 10px 16px; border: 0; border-radius: 6px; background: #111; color: #fff; font-weight: 600; cursor: pointer; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .ok { color: #15803d; } .err { color: #b91c1c; }
+    pre { background: #f4f4f5; padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; }
+    code { background: #f4f4f5; padding: 1px 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>WorkBuddy · 添加 CodeBuddy API Key</h1>
+    <p>不要把 API Key 填进 OAuth「回调 URL / 授权码」框——CPA 宿主会校验 <code>state</code>，插件收不到粘贴内容。</p>
+    <p>请在此提交，或用下方 curl / Auth Files 上传 JSON。</p>
+    <label>Management Token（与 CPA 管理面板相同）</label>
+    <input id="token" placeholder="Bearer token / management key" autocomplete="off" />
+	    <label>CodeBuddy API Key</label>
+	    <textarea id="key" placeholder="粘贴 CodeBuddy API Key"></textarea>
+	    <label>User ID（可选，默认 anonymous）</label>
+	    <input id="uid" value="anonymous" />
+	    <label>prefix（可选，模型前缀，单段无 /）</label>
+	    <input id="prefix" placeholder="例如 wb" />
+	    <label>proxy_url（可选，该凭据出站代理）</label>
+	    <input id="proxy" placeholder="http://127.0.0.1:7890" />
+	    <label>priority（可选，调度优先级，整数）</label>
+	    <input id="priority" type="number" placeholder="0" />
+	    <button id="btn" onclick="saveKey()">保存</button>
+	    <p id="msg"></p>
+	    <pre id="out" hidden></pre>
+	  </div>
+	  <script>
+	    (function(){
+	      const params = new URLSearchParams(location.search);
+	      const fromQuery = params.get('token') || params.get('management_key') || '';
+	      let fromParent = '';
+	      try {
+	        fromParent = localStorage.getItem('management_key')
+	          || localStorage.getItem('cpa_management_key')
+	          || localStorage.getItem('cliproxy_management_key')
+	          || '';
+	      } catch (e) {}
+	      if (fromQuery || fromParent) document.getElementById('token').value = fromQuery || fromParent;
+	    })();
+	    async function saveKey(){
+	      const token = document.getElementById('token').value.trim();
+	      const api_key = document.getElementById('key').value.trim();
+	      const user_id = document.getElementById('uid').value.trim() || 'anonymous';
+	      const prefix = document.getElementById('prefix').value.trim();
+	      const proxy_url = document.getElementById('proxy').value.trim();
+	      const priorityRaw = document.getElementById('priority').value.trim();
+	      const msg = document.getElementById('msg');
+	      const out = document.getElementById('out');
+	      msg.textContent = ''; out.hidden = true;
+	      if (!api_key) { msg.innerHTML = '<span class="err">请填写 API Key</span>'; return; }
+	      if (!token) { msg.innerHTML = '<span class="err">请填写 Management Token</span>'; return; }
+	      const body = { api_key, user_id };
+	      if (prefix) body.prefix = prefix;
+	      if (proxy_url) body.proxy_url = proxy_url;
+	      if (priorityRaw !== '') body.priority = Number(priorityRaw);
+	      const btn = document.getElementById('btn');
+	      btn.disabled = true;
+	      try {
+	        const r = await fetch('/v0/management/workbuddy/api-key', {
+	          method: 'POST',
+	          headers: {
+	            'Authorization': 'Bearer ' + token,
+	            'Content-Type': 'application/json'
+	          },
+	          body: JSON.stringify(body)
+	        });
+	        const text = await r.text();
+	        let data; try { data = JSON.parse(text); } catch { data = { raw: text }; }
+	        out.hidden = false; out.textContent = JSON.stringify(data, null, 2);
+	        if (r.ok && data.status === 'ok') {
+	          msg.innerHTML = '<span class="ok">已保存：' + (data.fileName || data.id || '') + '</span>';
+	        } else {
+	          msg.innerHTML = '<span class="err">失败 HTTP ' + r.status + '</span>';
+	        }
+	      } catch (e) {
+	        msg.innerHTML = '<span class="err">' + e + '</span>';
+	      } finally {
+	        btn.disabled = false;
+	      }
+	    }
+	  </script>
+</body>
+</html>`
 
 // -----------------------------------------------------------------------------
 // envelope helpers

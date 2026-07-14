@@ -3,5 +3,8 @@
   "auth_type": "api_key",
   "api_key": "YOUR_CODEBUDDY_API_KEY",
   "user_id": "anonymous",
-  "domain": "copilot.tencent.com"
+  "domain": "copilot.tencent.com",
+  "prefix": "",
+  "proxy_url": "",
+  "priority": 0
 }

@@ -57,15 +57,22 @@ Upstream: `https://copilot.tencent.com` · chat `/v2/chat/completions`.
 OAuth (legacy login result):
 
 ```json
-{"type":"workbuddy","auth":{"accessToken":"...","refreshToken":"...","expiresAt":0,"domain":"..."},"account":{"uid":"...","enterpriseId":"...","nickname":"..."}}
+{"type":"workbuddy","auth":{"accessToken":"...","refreshToken":"...","expiresAt":0,"domain":"..."},"account":{"uid":"...","enterpriseId":"...","nickname":"..."},"prefix":"","proxy_url":"","priority":0}
 ```
 
 API key:
 
 ```json
-{"type":"workbuddy","auth_type":"api_key","api_key":"...","user_id":"anonymous","domain":"copilot.tencent.com"}
+{"type":"workbuddy","auth_type":"api_key","api_key":"...","user_id":"anonymous","domain":"copilot.tencent.com","prefix":"wb","proxy_url":"http://127.0.0.1:7890","priority":100}
 ```
 
+CPA standard root fields (must round-trip via `toAuthData`):
+
+- `prefix` → `AuthData.Prefix` + metadata
+- `proxy_url` → `AuthData.ProxyURL` + metadata; `httpClientForAuth` uses it
+- `priority` → metadata + `Attributes["priority"]` (omit attribute when 0)
+
+Refresh merges host `Metadata`/`Attributes` when storage omitted the fields (`applyHostCredentialFields`).
 ## Gotchas (do not “simplify” away)
 
 1. **Claude Code blocklist** — `sanitizeBlockedTemplates` (`CLI`→`CLI tool`, `Main branch`→`Default branch`).
