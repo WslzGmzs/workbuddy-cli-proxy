@@ -1,9 +1,9 @@
 // Package main implements the workbuddy CLIProxyAPI dynamic plugin.
 //
 // workbuddy wraps Tencent CodeBuddy (copilot.tencent.com) as a cliproxy
-// provider: it performs the CodeBuddy web login flow, refreshes access
-// tokens, and forwards OpenAI-compatible chat completion requests to the
-// upstream /v2/chat/completions endpoint.
+// provider: it performs the CodeBuddy web login flow, accepts manual API-key
+// credentials, refreshes OAuth access tokens, and forwards OpenAI-compatible
+// chat completion requests to the upstream /v2/chat/completions endpoint.
 //
 // This file is a clean-room reimplementation reconstructed from the public
 // workbuddy.so binary (symbol table, string constants and RPC shape) published
@@ -65,6 +65,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -74,12 +77,18 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// pluginVersion is injected at link time for release builds:
+//   -ldflags "-X main.pluginVersion=0.2.0"
+var pluginVersion = "0.2.0"
+
 const (
-	providerName  = "workbuddy"
-	authFileName  = "workbuddy.json"
-	upstreamBase  = "https://copilot.tencent.com"
-	clientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originReferer = "https://www.codebuddy.cn"
+	providerName   = "workbuddy"
+	authFileName   = "workbuddy.json"
+	authTypeOAuth  = "oauth"
+	authTypeAPIKey = "api_key"
+	upstreamBase   = "https://copilot.tencent.com"
+	clientUA       = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originReferer  = "https://www.codebuddy.cn"
 
 	endpointAuthState    = upstreamBase + "/v2/plugin/auth/state?platform=CLI"
 	endpointLoginAcct    = upstreamBase + "/v2/plugin/login/account?state="
@@ -295,9 +304,9 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.1.0",
-			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
-			GitHubRepository: "https://github.com/lovingfish/workbuddy-cliproxy",
+			Version:          pluginVersion,
+			Author:           "WslzGmzs (clean-room rebuild; original workbuddy by Sliverkiss)",
+			GitHubRepository: "https://github.com/WslzGmzs/workbuddy-cli-proxy",
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,
@@ -350,9 +359,27 @@ func wbModels() []pluginapi.ModelInfo {
 // -----------------------------------------------------------------------------
 
 // storedAuth is the on-disk shape of a workbuddy credential.
+//
+// Two auth modes are supported:
+//  1. oauth (default / legacy): QR / web login → accessToken + refreshToken
+//  2. api_key: manually pasted CodeBuddy API key
+//
+// Recognized shapes for manual import (CPA auth file / upload):
+//
+//	{"type":"workbuddy","auth_type":"api_key","api_key":"...","user_id":"anonymous","domain":"copilot.tencent.com"}
+//	{"type":"workbuddy","apiKey":"..."}
+//	{"auth":{"accessToken":"...","refreshToken":"..."},"account":{...}}  // legacy oauth
 type storedAuth struct {
-	Auth    storedTokens  `json:"auth"`
-	Account storedAccount `json:"account"`
+	Type         string        `json:"type,omitempty"`
+	AuthType     string        `json:"auth_type,omitempty"`
+	APIKey       string        `json:"api_key,omitempty"`
+	APIKeyCamel  string        `json:"apiKey,omitempty"`
+	UserID       string        `json:"user_id,omitempty"`
+	Domain       string        `json:"domain,omitempty"`
+	Endpoint     string        `json:"endpoint,omitempty"`
+	EnterpriseID string        `json:"enterprise_id,omitempty"`
+	Auth         storedTokens  `json:"auth"`
+	Account      storedAccount `json:"account"`
 }
 
 type storedTokens struct {
@@ -402,10 +429,153 @@ func parseStored(raw []byte) (*storedAuth, error) {
 	if err := json.Unmarshal(raw, &sa); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
-	if sa.Auth.AccessToken == "" {
-		return nil, fmt.Errorf("parse_error: missing accessToken")
+	normalizeStored(&sa)
+
+	// Reject credentials that clearly belong to another provider.
+	if t := strings.ToLower(strings.TrimSpace(sa.Type)); t != "" && t != providerName && t != "codebuddy" {
+		return nil, fmt.Errorf("parse_error: foreign type %q", sa.Type)
+	}
+
+	switch sa.authMode() {
+	case authTypeAPIKey:
+		if sa.resolvedAPIKey() == "" {
+			return nil, fmt.Errorf("parse_error: missing api_key")
+		}
+	default:
+		if sa.Auth.AccessToken == "" {
+			return nil, fmt.Errorf("parse_error: missing accessToken")
+		}
 	}
 	return &sa, nil
+}
+
+// normalizeStored fills defaults and collapses camelCase / snake_case aliases.
+func normalizeStored(sa *storedAuth) {
+	if sa == nil {
+		return
+	}
+	if sa.APIKey == "" && sa.APIKeyCamel != "" {
+		sa.APIKey = strings.TrimSpace(sa.APIKeyCamel)
+	}
+	sa.APIKey = strings.TrimSpace(sa.APIKey)
+	sa.APIKeyCamel = ""
+	sa.AuthType = strings.ToLower(strings.TrimSpace(sa.AuthType))
+	sa.Type = strings.TrimSpace(sa.Type)
+	sa.UserID = strings.TrimSpace(sa.UserID)
+	sa.Domain = strings.TrimSpace(sa.Domain)
+	sa.Endpoint = strings.TrimSpace(sa.Endpoint)
+	sa.EnterpriseID = strings.TrimSpace(sa.EnterpriseID)
+
+	// Infer api_key mode when the key is present but auth_type was omitted.
+	if sa.AuthType == "" && sa.APIKey != "" && sa.Auth.AccessToken == "" {
+		sa.AuthType = authTypeAPIKey
+	}
+	if sa.AuthType == "" {
+		sa.AuthType = authTypeOAuth
+	}
+	if sa.Type == "" {
+		sa.Type = providerName
+	}
+	if sa.AuthType == authTypeAPIKey {
+		if sa.UserID == "" {
+			if sa.Account.UID != "" {
+				sa.UserID = sa.Account.UID
+			} else {
+				sa.UserID = "anonymous"
+			}
+		}
+		if sa.Domain == "" {
+			if sa.Auth.Domain != "" {
+				sa.Domain = sa.Auth.Domain
+			} else {
+				sa.Domain = "copilot.tencent.com"
+			}
+		}
+		if sa.Account.UID == "" {
+			sa.Account.UID = sa.UserID
+		}
+		if sa.Account.EnterpriseID == "" && sa.EnterpriseID != "" {
+			sa.Account.EnterpriseID = sa.EnterpriseID
+		}
+		if sa.Auth.Domain == "" {
+			sa.Auth.Domain = sa.Domain
+		}
+	}
+}
+
+func (sa *storedAuth) authMode() string {
+	if sa == nil {
+		return authTypeOAuth
+	}
+	mode := strings.ToLower(strings.TrimSpace(sa.AuthType))
+	if mode == authTypeAPIKey || mode == "apikey" || mode == "key" {
+		return authTypeAPIKey
+	}
+	if sa.resolvedAPIKey() != "" && sa.Auth.AccessToken == "" {
+		return authTypeAPIKey
+	}
+	return authTypeOAuth
+}
+
+func (sa *storedAuth) resolvedAPIKey() string {
+	if sa == nil {
+		return ""
+	}
+	if k := strings.TrimSpace(sa.APIKey); k != "" {
+		return k
+	}
+	return strings.TrimSpace(sa.APIKeyCamel)
+}
+
+func (sa *storedAuth) isAPIKey() bool {
+	return sa.authMode() == authTypeAPIKey
+}
+
+func (sa *storedAuth) label() string {
+	if sa == nil {
+		return "WorkBuddy"
+	}
+	if sa.isAPIKey() {
+		key := sa.resolvedAPIKey()
+		if len(key) > 12 {
+			return "WorkBuddy API Key (" + key[:6] + "…" + key[len(key)-4:] + ")"
+		}
+		return "WorkBuddy API Key"
+	}
+	if sa.Account.Nickname != "" {
+		return "WorkBuddy (" + sa.Account.Nickname + ")"
+	}
+	if sa.Account.UID != "" {
+		return "WorkBuddy (" + sa.Account.UID + ")"
+	}
+	return "WorkBuddy"
+}
+
+func (sa *storedAuth) authID() string {
+	if sa == nil {
+		return providerName
+	}
+	if sa.isAPIKey() {
+		// Stable-ish id from key fingerprint so multiple keys can coexist.
+		sum := fmt.Sprintf("%x", shortHash(sa.resolvedAPIKey()))
+		return providerName + "-key-" + sum
+	}
+	if sa.Account.UID != "" {
+		return providerName + "-" + sa.Account.UID
+	}
+	return providerName
+}
+
+func shortHash(s string) []byte {
+	// FNV-1a 32-bit, no extra import weight for crypto.
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return []byte{
+		byte(h >> 24), byte(h >> 16), byte(h >> 8), byte(h),
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -450,32 +620,63 @@ func commonHeaders(req *http.Request) {
 
 // backendHeaders applies auth-derived headers to a chat completion request.
 // Empty fields are signalled via the X-No-* convention used by CodeBuddy.
+// API-key mode sends both Authorization Bearer and X-API-Key (CodeBuddy accepts either).
 func backendHeaders(req *http.Request, sa *storedAuth) {
 	commonHeaders(req)
-	if sa.Auth.AccessToken != "" {
+	if sa.isAPIKey() {
+		key := sa.resolvedAPIKey()
+		if key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+			req.Header.Set("X-API-Key", key)
+		} else {
+			req.Header.Set("X-No-Authorization", "1")
+		}
+	} else if sa.Auth.AccessToken != "" {
 		req.Header.Set("Authorization", "Bearer "+sa.Auth.AccessToken)
 	} else {
 		req.Header.Set("X-No-Authorization", "1")
 	}
-	if sa.Account.UID != "" {
-		req.Header.Set("X-User-Id", sa.Account.UID)
+
+	userID := sa.Account.UID
+	if userID == "" {
+		userID = sa.UserID
+	}
+	if userID != "" {
+		req.Header.Set("X-User-Id", userID)
 	} else {
 		req.Header.Set("X-No-User-Id", "1")
 	}
-	if sa.Account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
+
+	enterpriseID := sa.Account.EnterpriseID
+	if enterpriseID == "" {
+		enterpriseID = sa.EnterpriseID
+	}
+	if enterpriseID != "" {
+		req.Header.Set("X-Enterprise-Id", enterpriseID)
+		req.Header.Set("X-Tenant-Id", enterpriseID)
 	} else {
 		req.Header.Set("X-No-Enterprise-Id", "1")
 	}
-	if sa.Auth.RefreshToken != "" {
+
+	if !sa.isAPIKey() && sa.Auth.RefreshToken != "" {
 		req.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
 	}
-	if sa.Auth.Domain != "" {
-		req.Header.Set("X-Domain", sa.Auth.Domain)
+
+	domain := sa.Auth.Domain
+	if domain == "" {
+		domain = sa.Domain
+	}
+	if domain != "" {
+		req.Header.Set("X-Domain", domain)
 	} else {
 		req.Header.Set("X-No-Department-Info", "1")
 	}
+
 	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-IDE-Type", "CLI")
+	req.Header.Set("X-IDE-Name", "CLI")
+	req.Header.Set("X-IDE-Version", "2.63.2")
 }
 
 // doJSON sends method to fullURL with the given headers, parses the {code,msg,data}
@@ -523,25 +724,66 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 		// Not a workbuddy credential; let the host try other providers.
 		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
+	fileName := strings.TrimSpace(req.FileName)
+	if fileName == "" {
+		fileName = authFileName
+	}
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
-		Auth:    toAuthData(sa),
+		Auth:    toAuthData(sa, fileName),
 	})
 }
 
-func toAuthData(sa *storedAuth) pluginapi.AuthData {
-	storage, _ := json.Marshal(sa)
+func toAuthData(sa *storedAuth, fileName string) pluginapi.AuthData {
+	if fileName == "" {
+		fileName = authFileName
+	}
+	// Persist a cleaned shape so re-parse is stable across versions.
+	persist := *sa
+	normalizeStored(&persist)
+	if persist.isAPIKey() {
+		// Keep only api_key fields on disk for key mode (drop empty oauth noise).
+		persist.Auth = storedTokens{Domain: persist.Domain}
+	}
+	storage, _ := json.Marshal(persist)
+	meta := map[string]any{
+		"type":      providerName,
+		"auth_type": persist.authMode(),
+	}
+	if persist.isAPIKey() {
+		meta["api_key"] = true
+		if persist.UserID != "" {
+			meta["user_id"] = persist.UserID
+		}
+		if persist.Domain != "" {
+			meta["domain"] = persist.Domain
+		}
+	} else {
+		if persist.Account.UID != "" {
+			meta["uid"] = persist.Account.UID
+		}
+		if persist.Account.Nickname != "" {
+			meta["nickname"] = persist.Account.Nickname
+		}
+		if persist.Auth.Domain != "" {
+			meta["domain"] = persist.Auth.Domain
+		}
+	}
 	return pluginapi.AuthData{
 		Provider:    providerName,
-		ID:          providerName,
-		FileName:    authFileName,
-		Label:       "WorkBuddy",
+		ID:          sa.authID(),
+		FileName:    fileName,
+		Label:       sa.label(),
 		StorageJSON: storage,
-		Metadata:    map[string]any{"type": providerName},
+		Metadata:    meta,
 	}
 }
 
 func handleStartLogin(raw []byte) ([]byte, error) {
+	// Host may pass AuthDir / callback base via the start request; keep for poll metadata.
+	var startReq pluginapi.AuthLoginStartRequest
+	_ = json.Unmarshal(raw, &startReq)
+
 	client := newLoginClient()
 	data, _, err := doJSON(client, http.MethodPost, endpointAuthState, nil, bytes.NewReader([]byte("{}")))
 	if err != nil {
@@ -553,11 +795,20 @@ func handleStartLogin(raw []byte) ([]byte, error) {
 		return nil, fmt.Errorf("auth state: missing state or authUrl")
 	}
 	loginStates.Store(st.State, &loginCtx{client: client, expires: time.Now().Add(loginTTL)})
+	meta := map[string]any{
+		// Hint for operators / logs: the CPA "callback URL / auth code" box
+		// can paste a CodeBuddy API key (non-URL) to finish without QR.
+		"paste_hint": "Paste CodeBuddy API key in the callback/code box, or complete QR login.",
+	}
+	if dir := strings.TrimSpace(startReq.Host.AuthDir); dir != "" {
+		meta["auth_dir"] = dir
+	}
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
 		URL:       st.AuthURL,
 		State:     st.State,
 		ExpiresAt: time.Now().Add(loginTTL).UTC(),
+		Metadata:  meta,
 	})
 }
 
@@ -570,14 +821,47 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	if state == "" {
 		return nil, fmt.Errorf("poll: empty state")
 	}
+
+	authDir := strings.TrimSpace(req.Host.AuthDir)
+	if authDir == "" {
+		authDir = hostAuthDirFromRaw(raw, req.Metadata)
+	}
+
+	// 1) CPA panel paste box: host writes .oauth-workbuddy-<state>.oauth with
+	//    the pasted "callback URL / authorization code". We accept either a
+	//    raw API key or a URL (extract key/code query params when present).
+	if sa, handled, errPaste := tryConsumePastedCredential(authDir, state); handled {
+		loginStates.Delete(state)
+		if errPaste != nil {
+			return okEnvelope(pluginapi.AuthLoginPollResponse{
+				Status:  pluginapi.AuthLoginStatusError,
+				Message: errPaste.Error(),
+			})
+		}
+		fileName := sa.authID() + ".json"
+		return okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusSuccess,
+			Message: "api_key credential saved",
+			Auth:    toAuthData(sa, fileName),
+		})
+	}
+
+	// 2) QR / web login: poll CodeBuddy with the cookie-affined client.
 	v, ok := loginStates.Load(state)
 	if !ok {
-		return nil, fmt.Errorf("poll: unknown state (restart login)")
+		// No in-memory login and no paste yet — keep waiting (host may paste later).
+		return okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusPending,
+			Message: "waiting for QR login or API key paste",
+		})
 	}
 	lc := v.(*loginCtx)
 	if time.Now().After(lc.expires) {
 		loginStates.Delete(state)
-		return nil, fmt.Errorf("poll: login expired")
+		return okEnvelope(pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "login expired; restart login",
+		})
 	}
 
 	// Single-shot poll per RPC: the host drives the polling cadence.
@@ -611,6 +895,8 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	}
 
 	sa := &storedAuth{
+		Type:     providerName,
+		AuthType: authTypeOAuth,
 		Auth: storedTokens{
 			AccessToken:  tok.AccessToken,
 			RefreshToken: tok.RefreshToken,
@@ -624,10 +910,204 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		},
 	}
 	loginStates.Delete(state)
+	// Best-effort: drop any unused paste file for this state.
+	_ = consumeOAuthCallbackFile(authDir, state)
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status: pluginapi.AuthLoginStatusSuccess,
-		Auth:   toAuthData(sa),
+		Auth:   toAuthData(sa, authFileName),
 	})
+}
+
+// hostAuthDirFromRaw extracts AuthDir when typed HostConfigSummary is empty
+// (host JSON may use AuthDir / auth_dir depending on encoding path).
+func hostAuthDirFromRaw(raw []byte, metadata map[string]any) string {
+	if v, ok := metadata["auth_dir"].(string); ok {
+		if s := strings.TrimSpace(v); s != "" {
+			return s
+		}
+	}
+	var loose struct {
+		Host map[string]any `json:"Host"`
+		H2   map[string]any `json:"host"`
+	}
+	_ = json.Unmarshal(raw, &loose)
+	for _, m := range []map[string]any{loose.Host, loose.H2} {
+		if m == nil {
+			continue
+		}
+		for _, k := range []string{"AuthDir", "auth_dir", "authDir"} {
+			if v, ok := m[k].(string); ok {
+				if s := strings.TrimSpace(v); s != "" {
+					return s
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// oauthCallbackPayload matches CPA WriteOAuthCallbackFile JSON.
+type oauthCallbackPayload struct {
+	Code  string `json:"code"`
+	State string `json:"state"`
+	Error string `json:"error"`
+}
+
+func oauthCallbackFilePath(authDir, state string) string {
+	return filepath.Join(authDir, fmt.Sprintf(".oauth-%s-%s.oauth", providerName, strings.TrimSpace(state)))
+}
+
+func readOAuthCallbackFile(authDir, state string) (oauthCallbackPayload, bool, error) {
+	authDir = strings.TrimSpace(authDir)
+	state = strings.TrimSpace(state)
+	if authDir == "" || state == "" {
+		return oauthCallbackPayload{}, false, nil
+	}
+	path := oauthCallbackFilePath(authDir, state)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return oauthCallbackPayload{}, false, nil
+		}
+		return oauthCallbackPayload{}, false, err
+	}
+	var payload oauthCallbackPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return oauthCallbackPayload{}, false, fmt.Errorf("invalid oauth callback file: %w", err)
+	}
+	return payload, true, nil
+}
+
+func consumeOAuthCallbackFile(authDir, state string) error {
+	authDir = strings.TrimSpace(authDir)
+	state = strings.TrimSpace(state)
+	if authDir == "" || state == "" {
+		return nil
+	}
+	path := oauthCallbackFilePath(authDir, state)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// tryConsumePastedCredential reads the host paste box payload.
+// handled=false → no paste yet; handled=true + err → bad paste; handled=true + sa → success.
+func tryConsumePastedCredential(authDir, state string) (*storedAuth, bool, error) {
+	payload, ok, err := readOAuthCallbackFile(authDir, state)
+	if err != nil {
+		return nil, true, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	if msg := strings.TrimSpace(payload.Error); msg != "" {
+		_ = consumeOAuthCallbackFile(authDir, state)
+		return nil, true, fmt.Errorf("%s", msg)
+	}
+	pasted := strings.TrimSpace(payload.Code)
+	if pasted == "" {
+		return nil, false, nil
+	}
+
+	kind, value, errClass := classifyPastedCredential(pasted)
+	if errClass != nil {
+		_ = consumeOAuthCallbackFile(authDir, state)
+		return nil, true, errClass
+	}
+	switch kind {
+	case "api_key":
+		if err := consumeOAuthCallbackFile(authDir, state); err != nil {
+			return nil, true, fmt.Errorf("consume paste file: %w", err)
+		}
+		sa := &storedAuth{
+			Type:     providerName,
+			AuthType: authTypeAPIKey,
+			APIKey:   value,
+			UserID:   "anonymous",
+			Domain:   "copilot.tencent.com",
+		}
+		normalizeStored(sa)
+		return sa, true, nil
+	case "url":
+		_ = consumeOAuthCallbackFile(authDir, state)
+		return nil, true, fmt.Errorf("pasted URL is not a CodeBuddy API key; paste the API key string, or complete QR login in the browser")
+	default:
+		return nil, false, nil
+	}
+}
+
+// classifyPastedCredential decides whether the CPA paste box holds an API key
+// or a URL. Rules:
+//   - http(s) URL → "url" (optionally extract ?api_key= / ?key= / ?code= as api_key when present)
+//   - JSON object with api_key/apiKey → "api_key"
+//   - anything else non-empty → "api_key" (raw key)
+func classifyPastedCredential(pasted string) (kind, value string, err error) {
+	pasted = strings.TrimSpace(pasted)
+	if pasted == "" {
+		return "", "", fmt.Errorf("empty paste")
+	}
+
+	// Full JSON credential blob pasted by mistake / convenience.
+	if strings.HasPrefix(pasted, "{") {
+		var sa storedAuth
+		if err := json.Unmarshal([]byte(pasted), &sa); err == nil {
+			normalizeStored(&sa)
+			if sa.resolvedAPIKey() != "" {
+				return "api_key", sa.resolvedAPIKey(), nil
+			}
+		}
+	}
+
+	lower := strings.ToLower(pasted)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		u, errParse := url.Parse(pasted)
+		if errParse != nil {
+			return "url", pasted, fmt.Errorf("invalid URL: %w", errParse)
+		}
+		q := u.Query()
+		for _, key := range []string{"api_key", "apiKey", "key", "code"} {
+			if v := strings.TrimSpace(q.Get(key)); v != "" && !looksLikeOAuthError(v) {
+				// Prefer explicit api_key/key; "code" only if it looks like a key not a short oauth code.
+				if key == "code" && !looksLikeAPIKey(v) {
+					continue
+				}
+				if key == "code" || key == "api_key" || key == "apiKey" || key == "key" {
+					if looksLikeAPIKey(v) || key != "code" {
+						return "api_key", v, nil
+					}
+				}
+			}
+		}
+		// Bare callback URL with no usable key — not supported for workbuddy QR.
+		return "url", pasted, nil
+	}
+
+	if !looksLikeAPIKey(pasted) {
+		return "", "", fmt.Errorf("paste does not look like a CodeBuddy API key (got %d chars)", len(pasted))
+	}
+	return "api_key", pasted, nil
+}
+
+func looksLikeOAuthError(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "access_denied" || strings.HasPrefix(s, "error")
+}
+
+func looksLikeAPIKey(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) < 8 || len(s) > 512 {
+		return false
+	}
+	if strings.ContainsAny(s, " \t\r\n") {
+		return false
+	}
+	// Reject obvious non-keys.
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return false
+	}
+	return true
 }
 
 func handleRefreshAuth(raw []byte) ([]byte, error) {
@@ -638,6 +1118,13 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	sa, err := parseStored(req.StorageJSON)
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
+	}
+	// API keys do not rotate; return the same credential unchanged.
+	if sa.isAPIKey() {
+		return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa, authFileName)})
+	}
+	if sa.Auth.RefreshToken == "" {
+		return nil, fmt.Errorf("refresh: missing refreshToken")
 	}
 	headers := func(r *http.Request) {
 		commonHeaders(r)
@@ -666,7 +1153,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		sa.Auth.Domain = tok.Domain
 	}
 	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa, authFileName)})
 }
 
 // -----------------------------------------------------------------------------

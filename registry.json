@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "workbuddy",
+      "name": "WorkBuddy (CodeBuddy)",
+      "description": "Wraps Tencent CodeBuddy (copilot.tencent.com) as a CLIProxyAPI provider. Supports QR/OAuth login, panel-paste or uploaded API-key credentials, Claude Code system-template sanitization, hy3 max thinking, and true async streaming via host.stream.emit.",
+      "author": "WslzGmzs",
+      "version": "0.2.0",
+      "repository": "https://github.com/WslzGmzs/workbuddy-cli-proxy",
+      "homepage": "https://github.com/WslzGmzs/workbuddy-cli-proxy",
+      "license": "MIT",
+      "tags": [
+        "Provider",
+        "CodeBuddy",
+        "WorkBuddy",
+        "Claude"
+      ]
+    }
+  ]
+}

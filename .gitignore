@@ -3,9 +3,14 @@
 *.dylib
 *.dll
 *.h
+/dist/
+workbuddy_*.zip
+workbuddy_*.zip.sha256
+checksums.txt
 
-# 凭据(含 access/refresh token,切勿提交)
+# 凭据(含 access/refresh token / api_key,切勿提交)
 workbuddy.json
+*-credentials.json
 
 # Go
 /vendor/

@@ -1,0 +1,7 @@
+{
+  "type": "workbuddy",
+  "auth_type": "api_key",
+  "api_key": "YOUR_CODEBUDDY_API_KEY",
+  "user_id": "anonymous",
+  "domain": "copilot.tencent.com"
+}

@@ -1,0 +1,251 @@
+# Build multi-platform workbuddy plugin assets and publish them on v* tags.
+# Asset layout matches CLIProxyAPI plugin store:
+#   workbuddy_<version>_<goos>_<goarch>.zip  (library at zip root)
+#   checksums.txt
+#
+# Install from CPA management UI once the repo is listed in
+# https://github.com/router-for-me/CLIProxyAPI-Plugins-Store/blob/main/registry.json
+# or by pointing store-sources at a private registry.
+
+name: Build
+
+on:
+  pull_request:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_ID: workbuddy
+
+jobs:
+  vet:
+    name: Vet
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: vet
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-24.04
+            ext: so
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            ext: so
+          - goos: darwin
+            goarch: amd64
+            runner: macos-15-intel
+            ext: dylib
+          - goos: darwin
+            goarch: arm64
+            runner: macos-15
+            ext: dylib
+          - goos: windows
+            goarch: amd64
+            runner: windows-2025
+            ext: dll
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve release metadata
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "LIB_NAME=${PLUGIN_ID}.${{ matrix.ext }}" >> "${GITHUB_ENV}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_${{ matrix.goos }}_${{ matrix.goarch }}.zip" >> "${GITHUB_ENV}"
+
+      - name: Build shared library
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -buildmode=c-shared \
+              -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
+              -o "dist/${LIB_NAME}" .
+          rm -f "dist/${PLUGIN_ID}.h" dist/*.h
+
+      - name: Package plugin
+        run: |
+          set -euo pipefail
+          go run ./.github/scripts/package-release.go \
+            -library "dist/${LIB_NAME}" \
+            -archive "${ARCHIVE_NAME}" \
+            -checksum "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+
+  build-windows-arm64:
+    name: Build windows/arm64
+    needs: vet
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve release metadata
+        id: release_metadata
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "ARCHIVE_NAME=${PLUGIN_ID}_${VERSION}_windows_arm64.zip" >> "${GITHUB_ENV}"
+
+      - name: Build Windows ARM64 shared library
+        timeout-minutes: 45
+        uses: go-cross/cgo-actions@v1
+        env:
+          GOFLAGS: -trimpath -buildmode=c-shared
+        with:
+          dir: .
+          packages: .
+          targets: windows-arm64
+          out-dir: dist/windows-arm64
+          output: ${{ env.PLUGIN_ID }}.dll
+          flags: -ldflags=-s -w
+          x-flags: main.pluginVersion=${{ steps.release_metadata.outputs.version }}
+
+      - name: Package plugin
+        run: |
+          set -euo pipefail
+          rm -f go-cross-bin.h "dist/windows-arm64/${PLUGIN_ID}.h"
+          go run ./.github/scripts/package-release.go \
+            -library "dist/windows-arm64/${PLUGIN_ID}.dll" \
+            -archive "${ARCHIVE_NAME}" \
+            -checksum "${ARCHIVE_NAME}.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build
+      - build-windows-arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sort dist/*.sha256 > dist/checksums.txt
+          notes="$(cat <<'EOF'
+          ## workbuddy ${GITHUB_REF_NAME}
+
+          CLIProxyAPI plugin for Tencent CodeBuddy (`copilot.tencent.com`).
+
+          ### Install (plugin store)
+          1. Ensure CLIProxyAPI v7.2+ with plugins enabled.
+          2. Install from the plugin store (or `POST /v0/management/plugin-store/workbuddy/install` with management key).
+          3. Enable in `config.yaml`:
+
+          ```yaml
+          plugins:
+            enabled: true
+            dir: "plugins"
+            configs:
+              workbuddy: { enabled: true, priority: 100 }
+          ```
+
+          ### Credentials
+          - **OAuth / QR login** via CPA management UI (workbuddy provider).
+          - **Manual API key**: upload an auth file, e.g.
+
+          ```json
+          {
+            "type": "workbuddy",
+            "auth_type": "api_key",
+            "api_key": "YOUR_CODEBUDDY_API_KEY",
+            "user_id": "anonymous",
+            "domain": "copilot.tencent.com"
+          }
+          ```
+
+          ### Assets
+          Zip root contains only `workbuddy.so` / `.dylib` / `.dll` per platform.
+          EOF
+          )"
+          # Expand version in notes
+          notes="${notes//\$\{GITHUB_REF_NAME\}/${GITHUB_REF_NAME}}"
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt --clobber --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/*.zip dist/checksums.txt \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "${notes}"
+          fi
