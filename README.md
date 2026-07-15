@@ -212,6 +212,8 @@ oauth-excluded-models:
 
 插件会把这些写进 `Metadata` + `Attributes`，供 CPA 注册模型与路由时使用；execute 侧对 `excluded_models` 再做一次拒绝。
 
+**注意（别名 / 前缀请求）**：客户端可用 `WorkBuddy/hy3`、`wb/hy3` 或别名 id。CPA 会在 `ExecutorRequest.Model` 上解析前缀/别名，但同为 chat-completions 时**不会**改写请求体里的 `model`。本插件在转发前会把 body 的 `model` 写成上游真实 id（去前缀 + 反查 `model_aliases`），否则 CodeBuddy 会返回 `11102 model […] service info not found`。
+
 ## 使用
 
 CPA 默认端口 `8317`，客户端 API key 见 `config.yaml` 的 `api-keys`。

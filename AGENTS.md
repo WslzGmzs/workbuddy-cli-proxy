@@ -83,14 +83,15 @@ API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports ligh
 ## Gotchas (do not “simplify” away)
 
 1. **Claude Code blocklist** — `sanitizeBlockedTemplates` (`CLI`→`CLI tool`, `Main branch`→`Default branch`).
-2. **hy3 thinking** — prefix `hy3` → force `reasoning_effort=high`.
-3. **Streaming** — true streaming via host emit; emit failure stops pump.
-4. **SSE framing** — `clientNeedsSSEFrame` for non-`/v1/chat/completions` paths.
-5. **Login cookies** — one jar per login `state` (`loginCtx`).
-6. **Chunk cleanup** — `cleanChunkJSON` drops empty delta fields.
-7. **Credentials** — never log/commit `workbuddy.json` or API keys.
-8. **Store packaging** — zip must contain **only** `workbuddy.<ext>` at root; asset name `workbuddy_<ver>_<goos>_<goarch>.zip`.
-9. **API key vs OAuth** — do not send refresh headers for api_key mode; do not require `accessToken` when `api_key` is set.
+2. **hy3 thinking** — bare / hy3-family model → force `reasoning_effort=high`.
+3. **Model id for upstream** — CPA resolves prefix/alias into `ExecutorRequest.Model` but does **not** rewrite payload `model` when formats already match chat-completions. Always run `rewriteModelForUpstream` before send (strip `prefix/` / `WorkBuddy/`, reverse `model_aliases`), else CodeBuddy returns `11102 model … service info not found`.
+4. **Streaming** — true streaming via host emit; emit failure stops pump.
+5. **SSE framing** — `clientNeedsSSEFrame` for non-`/v1/chat/completions` paths.
+6. **Login cookies** — one jar per login `state` (`loginCtx`).
+7. **Chunk cleanup** — `cleanChunkJSON` drops empty delta fields.
+8. **Credentials** — never log/commit `workbuddy.json` or API keys.
+9. **Store packaging** — zip must contain **only** `workbuddy.<ext>` at root; asset name `workbuddy_<ver>_<goos>_<goarch>.zip`.
+10. **API key vs OAuth** — do not send refresh headers for api_key mode; do not require `accessToken` when `api_key` is set.
 
 ## Conventions
 
@@ -104,4 +105,4 @@ API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports ligh
 
 - `README.md` — install, credentials, store PR flow
 - `docs/plugin-store-entry.json` — registry entry
-- Comments on `rewriteSystemForUpstream`, `forceMaxThinking`, `handleExecStream`, `clientNeedsSSEFrame`, `parseStored` / `backendHeaders`
+- Comments on `rewriteModelForUpstream`, `rewriteSystemForUpstream`, `forceMaxThinking`, `handleExecStream`, `clientNeedsSSEFrame`, `parseStored` / `backendHeaders`

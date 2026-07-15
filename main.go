@@ -1617,13 +1617,19 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	applyHostCredentialFields(sa, req.Metadata, nil)
+	applyHostCredentialFields(sa, firstNonNilMap(req.AuthMetadata, req.Metadata), req.AuthAttributes)
 	if sa.Disabled {
 		return nil, fmt.Errorf("auth_disabled: workbuddy credential is disabled")
 	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
-	body := rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))
+	//
+	// CPA resolves prefix/alias into req.Model, but when input format already
+	// matches executor chat-completions it does not rewrite payload "model".
+	// Without this step client aliases like "WorkBuddy/hy3" leak upstream (11102).
+	body := forceStreamBody(req.Payload, req.OriginalRequest)
+	body = rewriteModelForUpstream(body, req.Model, sa)
+	body = rewriteSystemForUpstream(body)
 	if err := ensureModelAllowed(body, sa); err != nil {
 		return nil, err
 	}
@@ -1665,7 +1671,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	applyHostCredentialFields(sa, req.Metadata, nil)
+	applyHostCredentialFields(sa, firstNonNilMap(req.AuthMetadata, req.Metadata), req.AuthAttributes)
 	if sa.Disabled {
 		return nil, fmt.Errorf("auth_disabled: workbuddy credential is disabled")
 	}
@@ -1673,6 +1679,9 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if len(body) == 0 {
 		body = req.OriginalRequest
 	}
+	// Same chat-completions path as execute: host may leave payload.model as the
+	// client-facing id (prefix/alias). Rewrite to the upstream model before send.
+	body = rewriteModelForUpstream(body, req.Model, sa)
 	body = rewriteSystemForUpstream(body)
 	if err := ensureModelAllowed(body, sa); err != nil {
 		return nil, err
@@ -1961,7 +1970,10 @@ func sanitizeBlockedTemplates(s string) string {
 // reasoning), so we override whatever the client sent. Returns true if changed.
 func forceMaxThinking(obj map[string]any) bool {
 	model, _ := obj["model"].(string)
-	if !strings.HasPrefix(model, "hy3") {
+	// After rewriteModelForUpstream the id should already be bare (hy3…); still
+	// tolerate a leftover client prefix so thinking is forced when intended.
+	bare := stripClientModelPrefix(model, nil)
+	if !strings.HasPrefix(bare, "hy3") && !strings.HasPrefix(model, "hy3") {
 		return false
 	}
 	if eff, _ := obj["reasoning_effort"].(string); eff == "high" {
@@ -1969,6 +1981,128 @@ func forceMaxThinking(obj map[string]any) bool {
 	}
 	obj["reasoning_effort"] = "high"
 	return true
+}
+
+// rewriteModelForUpstream writes the host-resolved / alias-mapped upstream model
+// id into the request body. CPA puts the resolved id on ExecutorRequest.Model
+// but leaves payload.model unchanged for same-format chat-completions.
+func rewriteModelForUpstream(payload []byte, hostModel string, sa *storedAuth) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return payload
+	}
+	payloadModel, _ := obj["model"].(string)
+	resolved := resolveUpstreamModel(hostModel, payloadModel, sa)
+	if resolved == "" {
+		return payload
+	}
+	if cur, _ := obj["model"].(string); cur == resolved {
+		return payload
+	}
+	obj["model"] = resolved
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return payload
+	}
+	return out
+}
+
+// resolveUpstreamModel prefers the host-resolved model, then the payload model,
+// strips client-facing prefixes, and maps credential model_aliases reverse.
+func resolveUpstreamModel(hostModel, payloadModel string, sa *storedAuth) string {
+	m := strings.TrimSpace(hostModel)
+	if m == "" {
+		m = strings.TrimSpace(payloadModel)
+	}
+	if m == "" {
+		return ""
+	}
+	bare := stripClientModelPrefix(m, sa)
+	if mapped := mapAliasToUpstream(bare, sa); mapped != "" {
+		return mapped
+	}
+	return bare
+}
+
+// stripClientModelPrefix removes credential prefix / provider display prefixes
+// that CPA or clients attach (prefix/model, WorkBuddy/model, workbuddy-model).
+func stripClientModelPrefix(model string, sa *storedAuth) string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return model
+	}
+	candidates := make([]string, 0, 4)
+	if sa != nil {
+		if p := strings.TrimSpace(sa.Prefix); p != "" {
+			candidates = append(candidates, p)
+		}
+	}
+	candidates = append(candidates, providerName, "WorkBuddy")
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		for _, sep := range []string{"/", "-"} {
+			prefix := p + sep
+			if len(model) > len(prefix) && strings.EqualFold(model[:len(prefix)], prefix) {
+				return model[len(prefix):]
+			}
+		}
+	}
+	// Generic first-segment strip when it looks like provider/model and the
+	// provider segment is not itself a known bare workbuddy model id.
+	if i := strings.Index(model, "/"); i > 0 {
+		first, rest := model[:i], model[i+1:]
+		if rest != "" && !looksLikeWorkbuddyModelID(first) {
+			if strings.EqualFold(first, providerName) ||
+				strings.EqualFold(first, "WorkBuddy") ||
+				(sa != nil && sa.Prefix != "" && strings.EqualFold(first, sa.Prefix)) {
+				return rest
+			}
+		}
+	}
+	return model
+}
+
+func looksLikeWorkbuddyModelID(id string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	if id == "" {
+		return false
+	}
+	for _, m := range wbModels() {
+		if strings.EqualFold(m.ID, id) {
+			return true
+		}
+	}
+	// Common bare families even if list drifts.
+	return strings.HasPrefix(id, "hy3") ||
+		strings.HasPrefix(id, "glm-") ||
+		strings.HasPrefix(id, "kimi-") ||
+		strings.HasPrefix(id, "minimax-") ||
+		strings.HasPrefix(id, "deepseek-")
+}
+
+// mapAliasToUpstream maps a client-facing alias to the upstream model name
+// using credential model_aliases (name=upstream, alias=client).
+func mapAliasToUpstream(model string, sa *storedAuth) string {
+	model = strings.TrimSpace(model)
+	if model == "" || sa == nil || len(sa.ModelAliases) == 0 {
+		return ""
+	}
+	for _, a := range sa.ModelAliases {
+		alias := strings.TrimSpace(a.Alias)
+		name := strings.TrimSpace(a.Name)
+		if alias == "" || name == "" {
+			continue
+		}
+		if strings.EqualFold(model, alias) {
+			return name
+		}
+	}
+	return ""
 }
 
 // ensureModelAllowed rejects requests for models listed in the credential's
@@ -1986,15 +2120,9 @@ func ensureModelAllowed(payload []byte, sa *storedAuth) error {
 	if model == "" {
 		return nil
 	}
-	// Strip optional prefix for comparison (prefix/model or prefix-model).
-	bare := model
-	if sa.Prefix != "" {
-		p := sa.Prefix
-		if strings.HasPrefix(bare, p+"/") {
-			bare = strings.TrimPrefix(bare, p+"/")
-		} else if strings.HasPrefix(bare, p+"-") {
-			bare = strings.TrimPrefix(bare, p+"-")
-		}
+	bare := stripClientModelPrefix(model, sa)
+	if mapped := mapAliasToUpstream(bare, sa); mapped != "" {
+		bare = mapped
 	}
 	for _, ex := range sa.ExcludedModels {
 		if strings.EqualFold(model, ex) || strings.EqualFold(bare, ex) {
@@ -2100,6 +2228,15 @@ func firstNonEmpty(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstNonNilMap(vals ...map[string]any) map[string]any {
+	for _, v := range vals {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 func stripDataPrefix(s string) string {
