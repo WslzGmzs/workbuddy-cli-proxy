@@ -142,7 +142,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		response.len = 0
 	}
 	if method == nil {
-		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
+		writeResponse(response, errorEnvelope("invalid_method", "method is required", 0))
 		return 1
 	}
 	var requestBytes []byte
@@ -151,7 +151,8 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
 	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+		// Preserve HTTP status so CPA MarkResult can cool down / rotate auths on 401/402/429.
+		writeResponse(response, errorEnvelopeFromErr(errHandle))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -266,7 +267,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
 	default:
-		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+		return errorEnvelope("unknown_method", "unknown method: "+method, 0), nil
 	}
 }
 
@@ -281,9 +282,43 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
+		Code       string `json:"code"`
+		Message    string `json:"message"`
+		Retryable  bool   `json:"retryable,omitempty"`
+		HTTPStatus int    `json:"http_status,omitempty"`
+	}
+
+	// statusError implements CPA cliproxyexecutor.StatusError (StatusCode) and
+	// optional RetryAfter so the host can cool down / fail over credentials.
+	type statusError struct {
+		Message      string
+		Code         string
+		HTTPStatus   int
+		retryAfter   *time.Duration
+		Retryable    bool
+	}
+
+	func (e *statusError) Error() string {
+		if e == nil {
+			return "workbuddy error"
+		}
+		return e.Message
+	}
+
+	func (e *statusError) StatusCode() int {
+		if e == nil {
+			return 0
+		}
+		return e.HTTPStatus
+	}
+
+	// RetryAfter is the method name CPA retryAfterFromError looks for.
+	func (e *statusError) RetryAfter() *time.Duration {
+		if e == nil {
+			return nil
+		}
+		return e.retryAfter
+	}
 
 type identifierResponse struct {
 	Identifier string `json:"identifier"`
@@ -1638,21 +1673,21 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	backendHeaders(httpReq, sa)
-	resp, err := httpClientForAuth(sa).Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
+		resp, err := httpClientForAuth(sa).Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("http_error: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			payload, _ := io.ReadAll(resp.Body)
+			return nil, upstreamHTTPError(resp.StatusCode, payload, resp.Header)
+		}
+		completion, err := aggregateCompletion(resp.Body, req.Model)
+		if err != nil {
+			return nil, err
+		}
+		return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		payload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
-	}
-	completion, err := aggregateCompletion(resp.Body, req.Model)
-	if err != nil {
-		return nil, err
-	}
-	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
-}
 
 // executorStreamRequest wraps the host's executor.execute_stream RPC: the
 // ExecutorRequest plus the async stream id the host uses to receive chunks.
@@ -1688,29 +1723,39 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	}
 
 	headers := streamHeaders()
-	sseFramed := clientNeedsSSEFrame(req.Metadata)
+		sseFramed := clientNeedsSSEFrame(req.Metadata)
 
-	// No async stream id → fall back to synchronous chunk collection.
-	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
-		if errCollect != nil {
-			return nil, errCollect
+		// No async stream id → fall back to synchronous chunk collection.
+		if req.StreamID == "" {
+			chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
+			if errCollect != nil {
+				return nil, errCollect
+			}
+			return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 		}
-		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
-	}
 
-	// Async: return immediately with empty chunks. A goroutine pumps the upstream
-	// and emits each chunk via host.stream.emit so the client sees true streaming.
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
-	if err != nil {
-		streamEmitError(req.StreamID, err.Error())
-		streamClose(req.StreamID)
+		// Open the upstream connection *before* returning so 401/402/429 reach the
+		// host as execute_stream errors (with http_status). That lets CPA MarkResult
+		// cool down / rotate credentials. Mid-stream failures still go via emit.
+		httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		backendHeaders(httpReq, sa)
+		resp, err := httpClientForAuth(sa).Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("http_error: %w", err)
+		}
+		if resp.StatusCode >= 400 {
+			errPayload, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, upstreamHTTPError(resp.StatusCode, errPayload, resp.Header)
+		}
+
+		// Async pump of an already-accepted upstream stream body.
+		go pumpUpstreamResponse(resp, req.StreamID, sseFramed)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
-	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpClientForAuth(sa), httpReq, req.StreamID, sseFramed)
-	return okEnvelope(streamResponse{Headers: headers})
-}
 
 func streamHeaders() http.Header {
 	h := http.Header{}
@@ -1720,67 +1765,120 @@ func streamHeaders() http.Header {
 	return h
 }
 
-// pumpUpstreamStream reads the upstream SSE response in the background and
-// emits each cleaned chunk to the host stream. It closes the stream when done.
-// An emit failure (client disconnected → host closed the stream) aborts the
-// pump so we stop reading a dead upstream.
-func pumpUpstreamStream(client *http.Client, httpReq *http.Request, streamID string, sseFramed bool) {
-	if client == nil {
-		client = sharedHTTPClient()
-	}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
+// pumpUpstreamResponse reads an already-open upstream SSE body in the
+	// background and emits each cleaned chunk to the host stream. It closes the
+	// stream when done. An emit failure (client disconnected → host closed the
+	// stream) aborts the pump so we stop reading a dead upstream.
+	func pumpUpstreamResponse(resp *http.Response, streamID string, sseFramed bool) {
+		if resp == nil {
+			streamEmitError(streamID, "http_error: nil upstream response")
+			streamClose(streamID)
+			return
+		}
+		defer resp.Body.Close()
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
+		for scanner.Scan() {
+			content := stripDataPrefix(scanner.Text())
+			if content == "" || content == "[DONE]" {
+				continue
+			}
+			cleaned := cleanChunkJSON(content)
+			if cleaned == "" {
+				continue
+			}
+			if sseFramed {
+				cleaned = "data: " + cleaned
+			}
+			if err := streamEmit(streamID, []byte(cleaned)); err != nil {
+				break
+			}
+		}
 		streamClose(streamID)
-		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
-		return
-	}
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
-		content := stripDataPrefix(scanner.Text())
-		if content == "" || content == "[DONE]" {
-			continue
-		}
-		cleaned := cleanChunkJSON(content)
-		if cleaned == "" {
-			continue
-		}
-		if sseFramed {
-			cleaned = "data: " + cleaned
-		}
-		if err := streamEmit(streamID, []byte(cleaned)); err != nil {
-			break
-		}
-	}
-	streamClose(streamID)
-}
 
-// collectUpstreamStream is the synchronous fallback (no async stream id): drain
-// the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
-	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	// collectUpstreamStream is the synchronous fallback (no async stream id): drain
+	// the upstream, clean each chunk, return them as a slice.
+	func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
+		httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		backendHeaders(httpReq, sa)
+		resp, err := httpClientForAuth(sa).Do(httpReq)
+		if err != nil {
+			return nil, fmt.Errorf("http_error: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 400 {
+			errPayload, _ := io.ReadAll(resp.Body)
+			return nil, upstreamHTTPError(resp.StatusCode, errPayload, resp.Header)
+		}
+		return aggregateSSE(resp.Body, sseFramed), nil
 	}
-	backendHeaders(httpReq, sa)
-	resp, err := httpClientForAuth(sa).Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
+
+	// upstreamHTTPError builds a StatusError the CPA host can use for auth cooldown.
+	// 429 with CodeBuddy quota-exhausted (14018 / 额度已用尽) gets a long RetryAfter
+	// so the scheduler stops hammering the same credential.
+	func upstreamHTTPError(status int, body []byte, headers http.Header) error {
+		msg := fmt.Sprintf("upstream %d: %s", status, truncate(string(body), 200))
+		err := &statusError{
+			Message:    msg,
+			Code:       "upstream_error",
+			HTTPStatus: status,
+			Retryable:  status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500,
+		}
+		if status == http.StatusTooManyRequests {
+			if ra := parseRetryAfterHeader(headers); ra != nil {
+				err.retryAfter = ra
+			} else if isQuotaExhaustedBody(body) {
+				// Permanent-ish quota until the user recharges; cool for max CPA window.
+				d := 30 * time.Minute
+				err.retryAfter = &d
+			}
+		}
+		return err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
+
+	func parseRetryAfterHeader(headers http.Header) *time.Duration {
+		if headers == nil {
+			return nil
+		}
+		raw := strings.TrimSpace(headers.Get("Retry-After"))
+		if raw == "" {
+			return nil
+		}
+		// Seconds form.
+		if secs, err := strconv.Atoi(raw); err == nil && secs > 0 {
+			d := time.Duration(secs) * time.Second
+			return &d
+		}
+		// HTTP-date form.
+		if t, err := http.ParseTime(raw); err == nil {
+			d := time.Until(t)
+			if d > 0 {
+				return &d
+			}
+		}
+		return nil
 	}
-	return aggregateSSE(resp.Body, sseFramed), nil
-}
+
+	func isQuotaExhaustedBody(body []byte) bool {
+		s := string(body)
+		if s == "" {
+			return false
+		}
+		// CodeBuddy: {"error":{"data":{"code":14018,"msg":"额度已用尽…"}}}
+		if strings.Contains(s, "14018") {
+			return true
+		}
+		if strings.Contains(s, "额度已用尽") {
+			return true
+		}
+		lower := strings.ToLower(s)
+		return strings.Contains(lower, "quota") &&
+			(strings.Contains(lower, "exhaust") || strings.Contains(lower, "exceed") || strings.Contains(lower, "insufficient"))
+	}
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
 // "data: " SSE framing. CPA's chat-completions passthrough adds the prefix
@@ -2654,17 +2752,51 @@ const apiKeyPageHTML = `<!doctype html>
 // -----------------------------------------------------------------------------
 
 func okEnvelope(v any) ([]byte, error) {
-	result, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
+		result, err := json.Marshal(v)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(envelope{OK: true, Result: result})
 	}
-	return json.Marshal(envelope{OK: true, Result: result})
-}
 
-func errorEnvelope(code, message string) []byte {
-	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
-	return raw
-}
+	func errorEnvelope(code, message string, httpStatus int) []byte {
+		err := &envelopeError{Code: code, Message: message, HTTPStatus: httpStatus}
+		if httpStatus == http.StatusTooManyRequests || httpStatus == http.StatusRequestTimeout || httpStatus >= 500 {
+			err.Retryable = true
+		}
+		raw, _ := json.Marshal(envelope{OK: false, Error: err})
+		return raw
+	}
+
+	func errorEnvelopeFromErr(err error) []byte {
+		if err == nil {
+			return errorEnvelope("plugin_error", "plugin call failed", 0)
+		}
+		// Prefer typed statusError (and any StatusCode() implementer).
+		type statusCoder interface {
+			StatusCode() int
+		}
+		code := "plugin_error"
+		status := 0
+		retryable := false
+		message := err.Error()
+		if se, ok := err.(*statusError); ok && se != nil {
+			if se.Code != "" {
+				code = se.Code
+			}
+			status = se.HTTPStatus
+			retryable = se.Retryable
+			message = se.Message
+		} else if sc, ok := err.(statusCoder); ok && sc != nil {
+			status = sc.StatusCode()
+		}
+		envErr := &envelopeError{Code: code, Message: message, HTTPStatus: status, Retryable: retryable}
+		if !envErr.Retryable && (status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500) {
+			envErr.Retryable = true
+		}
+		raw, _ := json.Marshal(envelope{OK: false, Error: envErr})
+		return raw
+	}
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 	if response == nil || len(raw) == 0 {

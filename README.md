@@ -254,7 +254,17 @@ hy3 系列（`hy3` / `hy3-preview` / `hy3-preview-agent`）自动强制 `reasoni
 
 ## 流式
 
-真流式（async）：边读上游边通过 `host.stream.emit` 推给 CPA。
+真流式（async）：先连上上游再返回；边读上游边通过 `host.stream.emit` 推给 CPA。连上游时的 4xx/429 会作为 execute_stream 错误返回（带 `http_status`），便于 CPA 冷却/轮换凭据。
+
+## 额度 / 429 与多凭据轮换
+
+CPA 宿主本身支持 401/402/429 后冷却并换下一张 workbuddy 凭据，但**依赖插件把 HTTP 状态码带回去**。本插件会：
+
+- 把上游 `429`（含 CodeBuddy `14018` /「额度已用尽」）写成 RPC error envelope 的 `http_status: 429`
+- 额度耗尽时附带约 30 分钟 `Retry-After` 语义，避免同一凭据被连打
+- 有多条启用中的 workbuddy 凭据时，CPA 会冷却当前凭据并尝试其它凭据
+
+若只有一条凭据且额度用尽，仍会返回 429；充值后冷却到期或重启后可再试。也可在面板里临时 `disabled: true` 那条凭据。
 
 ## 发布 / 插件商店
 
