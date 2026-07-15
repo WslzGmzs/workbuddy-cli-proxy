@@ -6,5 +6,8 @@
   "domain": "copilot.tencent.com",
   "prefix": "",
   "proxy_url": "",
-  "priority": 0
+  "priority": 0,
+  "disabled": false,
+  "excluded_models": [],
+  "model_aliases": []
 }

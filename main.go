@@ -239,8 +239,12 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
 		return okEnvelope(wbRegistration())
-	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: wbModels()})
+	case pluginabi.MethodModelStatic:
+		// Models are bound to auth credentials (oauth scope). Static listing is empty
+		// so a disabled/no-auth install does not keep advertising workbuddy models.
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: nil})
+	case pluginabi.MethodModelForAuth:
+		return handleModelsForAuth(request)
 	case pluginabi.MethodAuthIdentifier:
 		return okEnvelope(identifierResponse{Identifier: providerName})
 	case pluginabi.MethodAuthParse:
@@ -316,10 +320,11 @@ func wbRegistration() registration {
 			GitHubRepository: "https://github.com/WslzGmzs/workbuddy-cli-proxy",
 		},
 		Capabilities: registrationCapability{
-			ModelProvider:         true,
-			AuthProvider:          true,
-			Executor:              true,
-			ExecutorModelScope:    pluginapi.ExecutorModelScopeBoth,
+			ModelProvider: true,
+			AuthProvider:  true,
+			Executor:      true,
+			// OAuth/auth-bound only: models appear when a non-disabled auth is loaded.
+			ExecutorModelScope:    pluginapi.ExecutorModelScopeOAuth,
 			ExecutorInputFormats:  []string{"chat-completions"},
 			ExecutorOutputFormats: []string{"chat-completions"},
 			ManagementAPI:         true,
@@ -381,20 +386,37 @@ func wbModels() []pluginapi.ModelInfo {
 // Standard CPA credential fields (same root keys as host synthesizer / panel PATCH):
 //
 //	"prefix": "wb", "proxy_url": "http://127.0.0.1:7890", "priority": 100
+//	"disabled": true
+//	"excluded_models": ["hy3","minimax-m3-pay"]
+//	"model_aliases": [{"name":"hy3-preview-agent","alias":"hy3","force-mapping":false}]
 type storedAuth struct {
-	Type         string        `json:"type,omitempty"`
-	AuthType     string        `json:"auth_type,omitempty"`
-	APIKey       string        `json:"api_key,omitempty"`
-	APIKeyCamel  string        `json:"apiKey,omitempty"`
-	UserID       string        `json:"user_id,omitempty"`
-	Domain       string        `json:"domain,omitempty"`
-	Endpoint     string        `json:"endpoint,omitempty"`
-	EnterpriseID string        `json:"enterprise_id,omitempty"`
-	Prefix       string        `json:"prefix,omitempty"`
-	ProxyURL     string        `json:"proxy_url,omitempty"`
-	Priority     flexInt       `json:"priority,omitempty"`
-	Auth         storedTokens  `json:"auth"`
-	Account      storedAccount `json:"account"`
+	Type           string   `json:"type,omitempty"`
+	AuthType       string   `json:"auth_type,omitempty"`
+	APIKey         string   `json:"api_key,omitempty"`
+	APIKeyCamel    string   `json:"apiKey,omitempty"`
+	UserID         string   `json:"user_id,omitempty"`
+	Domain         string   `json:"domain,omitempty"`
+	Endpoint       string   `json:"endpoint,omitempty"`
+	EnterpriseID   string   `json:"enterprise_id,omitempty"`
+	Prefix         string   `json:"prefix,omitempty"`
+	ProxyURL       string   `json:"proxy_url,omitempty"`
+	Priority       flexInt  `json:"priority,omitempty"`
+	Disabled       bool     `json:"disabled,omitempty"`
+	ExcludedModels []string `json:"excluded_models,omitempty"`
+	// ExcludedModelsAlt accepts host/panel hyphenated key on re-marshal via alias tag.
+	ExcludedModelsHyphen []string      `json:"excluded-models,omitempty"`
+	ModelAliases         []modelAlias  `json:"model_aliases,omitempty"`
+	ModelAliasesHyphen   []modelAlias  `json:"model-aliases,omitempty"`
+	Auth                 storedTokens  `json:"auth"`
+	Account              storedAccount `json:"account"`
+}
+
+// modelAlias matches CPA OAuthModelAlias JSON (name=upstream, alias=client-facing).
+type modelAlias struct {
+	Name         string `json:"name"`
+	Alias        string `json:"alias"`
+	ForceMapping bool   `json:"force-mapping,omitempty"`
+	Fork         bool   `json:"fork,omitempty"`
 }
 
 // flexInt accepts CPA priority as number or string (panel/synthesizer both appear).
@@ -538,6 +560,18 @@ func normalizeStored(sa *storedAuth) {
 	// CPA prefix: single path segment, no slashes (matches host synthesizer).
 	sa.Prefix = normalizeAuthPrefix(sa.Prefix)
 
+	// Merge hyphenated host keys into canonical snake_case fields.
+	if len(sa.ExcludedModels) == 0 && len(sa.ExcludedModelsHyphen) > 0 {
+		sa.ExcludedModels = sa.ExcludedModelsHyphen
+	}
+	sa.ExcludedModelsHyphen = nil
+	sa.ExcludedModels = cleanStringList(sa.ExcludedModels)
+	if len(sa.ModelAliases) == 0 && len(sa.ModelAliasesHyphen) > 0 {
+		sa.ModelAliases = sa.ModelAliasesHyphen
+	}
+	sa.ModelAliasesHyphen = nil
+	sa.ModelAliases = cleanModelAliases(sa.ModelAliases)
+
 	// Infer api_key mode when the key is present but auth_type was omitted.
 	if sa.AuthType == "" && sa.APIKey != "" && sa.Auth.AccessToken == "" {
 		sa.AuthType = authTypeAPIKey
@@ -584,6 +618,60 @@ func normalizeAuthPrefix(prefix string) string {
 	return prefix
 }
 
+func cleanStringList(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, s := range in {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		key := strings.ToLower(s)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func cleanModelAliases(in []modelAlias) []modelAlias {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]modelAlias, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, a := range in {
+		name := strings.TrimSpace(a.Name)
+		alias := strings.TrimSpace(a.Alias)
+		if name == "" || alias == "" || strings.EqualFold(name, alias) {
+			continue
+		}
+		key := strings.ToLower(alias)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, modelAlias{
+			Name:         name,
+			Alias:        alias,
+			ForceMapping: a.ForceMapping,
+			Fork:         a.Fork,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // applyHostCredentialFields copies CPA host-managed credential fields from
 // refresh/parse metadata when storage JSON omitted them (panel PATCH often
 // updates metadata without rewriting plugin storage).
@@ -607,12 +695,90 @@ func applyHostCredentialFields(sa *storedAuth, metadata map[string]any, attribut
 				sa.Priority = flexInt(n)
 			}
 		}
-	}
-	if attributes != nil && sa.Priority.Int() == 0 {
-		if n, err := strconv.Atoi(strings.TrimSpace(attributes["priority"])); err == nil {
-			sa.Priority = flexInt(n)
+		if !sa.Disabled {
+			if b, ok := metadata["disabled"].(bool); ok && b {
+				sa.Disabled = true
+			}
+		}
+		if len(sa.ExcludedModels) == 0 {
+			if list := stringListFromAny(metadata["excluded_models"]); len(list) > 0 {
+				sa.ExcludedModels = list
+			} else if list := stringListFromAny(metadata["excluded-models"]); len(list) > 0 {
+				sa.ExcludedModels = list
+			}
+		}
+		if len(sa.ModelAliases) == 0 {
+			if aliases := modelAliasesFromAny(metadata["model_aliases"]); len(aliases) > 0 {
+				sa.ModelAliases = aliases
+			} else if aliases := modelAliasesFromAny(metadata["model-aliases"]); len(aliases) > 0 {
+				sa.ModelAliases = aliases
+			}
 		}
 	}
+	if attributes != nil {
+		if sa.Priority.Int() == 0 {
+			if n, err := strconv.Atoi(strings.TrimSpace(attributes["priority"])); err == nil {
+				sa.Priority = flexInt(n)
+			}
+		}
+		if !sa.Disabled {
+			if strings.EqualFold(strings.TrimSpace(attributes["disabled"]), "true") {
+				sa.Disabled = true
+			}
+		}
+		if len(sa.ExcludedModels) == 0 {
+			if v := strings.TrimSpace(attributes["excluded_models"]); v != "" {
+				sa.ExcludedModels = cleanStringList(strings.Split(v, ","))
+			}
+		}
+		if len(sa.ModelAliases) == 0 {
+			if v := strings.TrimSpace(attributes["model_aliases"]); v != "" {
+				var aliases []modelAlias
+				if json.Unmarshal([]byte(v), &aliases) == nil {
+					sa.ModelAliases = cleanModelAliases(aliases)
+				}
+			}
+		}
+	}
+	sa.ExcludedModels = cleanStringList(sa.ExcludedModels)
+	sa.ModelAliases = cleanModelAliases(sa.ModelAliases)
+}
+
+func stringListFromAny(raw any) []string {
+	if raw == nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []string:
+		return cleanStringList(v)
+	case []any:
+		out := make([]string, 0, len(v))
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return cleanStringList(out)
+	case string:
+		return cleanStringList(strings.Split(v, ","))
+	default:
+		return nil
+	}
+}
+
+func modelAliasesFromAny(raw any) []modelAlias {
+	if raw == nil {
+		return nil
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var aliases []modelAlias
+	if json.Unmarshal(data, &aliases) != nil {
+		return nil
+	}
+	return cleanModelAliases(aliases)
 }
 
 func anyToInt(v any) (int, bool) {
@@ -914,6 +1080,9 @@ func toAuthData(sa *storedAuth, fileName string) pluginapi.AuthData {
 		// Keep only api_key fields on disk for key mode (drop empty oauth noise).
 		persist.Auth = storedTokens{Domain: persist.Domain}
 	}
+	// Avoid writing hyphen aliases into storage (canonical snake_case only).
+	persist.ExcludedModelsHyphen = nil
+	persist.ModelAliasesHyphen = nil
 	// Storage JSON includes CPA standard fields so panel PATCH + re-parse round-trip.
 	storage, _ := json.Marshal(persist)
 	meta := map[string]any{
@@ -928,6 +1097,18 @@ func toAuthData(sa *storedAuth, fileName string) pluginapi.AuthData {
 	}
 	if persist.Priority.Int() != 0 {
 		meta["priority"] = persist.Priority.Int()
+	}
+	if persist.Disabled {
+		meta["disabled"] = true
+	}
+	if len(persist.ExcludedModels) > 0 {
+		meta["excluded_models"] = append([]string(nil), persist.ExcludedModels...)
+		// Hyphen form for host synthesizers that only read excluded-models.
+		meta["excluded-models"] = append([]string(nil), persist.ExcludedModels...)
+	}
+	if len(persist.ModelAliases) > 0 {
+		meta["model_aliases"] = append([]modelAlias(nil), persist.ModelAliases...)
+		meta["model-aliases"] = append([]modelAlias(nil), persist.ModelAliases...)
 	}
 	if persist.isAPIKey() {
 		meta["api_key"] = true
@@ -952,6 +1133,24 @@ func toAuthData(sa *storedAuth, fileName string) pluginapi.AuthData {
 	if persist.Priority.Int() != 0 {
 		attrs["priority"] = strconv.Itoa(persist.Priority.Int())
 	}
+	if persist.Disabled {
+		attrs["disabled"] = "true"
+	}
+	// Host routing reads excluded_models / model_aliases from attributes.
+	if len(persist.ExcludedModels) > 0 {
+		attrs["excluded_models"] = strings.Join(persist.ExcludedModels, ",")
+	}
+	if len(persist.ModelAliases) > 0 {
+		if raw, err := json.Marshal(persist.ModelAliases); err == nil {
+			attrs["model_aliases"] = string(raw)
+		}
+	}
+	// auth_kind helps CPA merge global oauth-excluded-models when appropriate.
+	if persist.isAPIKey() {
+		attrs["auth_kind"] = "apikey"
+	} else {
+		attrs["auth_kind"] = "oauth"
+	}
 	return pluginapi.AuthData{
 		Provider:    providerName,
 		ID:          sa.authID(),
@@ -959,10 +1158,63 @@ func toAuthData(sa *storedAuth, fileName string) pluginapi.AuthData {
 		Label:       sa.label(),
 		Prefix:      persist.Prefix,
 		ProxyURL:    persist.ProxyURL,
+		Disabled:    persist.Disabled,
 		StorageJSON: storage,
 		Metadata:    meta,
 		Attributes:  attrs,
 	}
+}
+
+func handleModelsForAuth(raw []byte) ([]byte, error) {
+	// Request carries StorageJSON for the selected auth (and sometimes Metadata).
+	var req struct {
+		StorageJSON []byte         `json:"StorageJSON"`
+		Metadata    map[string]any `json:"Metadata"`
+		// Loose fallbacks used by some host encodings.
+		StorageJSONSnake []byte         `json:"storage_json"`
+		MetadataSnake    map[string]any `json:"metadata"`
+	}
+	_ = json.Unmarshal(raw, &req)
+	storage := req.StorageJSON
+	if len(storage) == 0 {
+		storage = req.StorageJSONSnake
+	}
+	meta := req.Metadata
+	if meta == nil {
+		meta = req.MetadataSnake
+	}
+	// Also try nested Executor-style envelope: {"Auth":{...}} via raw map.
+	if len(storage) == 0 {
+		var loose map[string]any
+		if json.Unmarshal(raw, &loose) == nil {
+			if m, ok := loose["Metadata"].(map[string]any); ok && meta == nil {
+				meta = m
+			}
+			for _, key := range []string{"StorageJSON", "storage_json", "storageJSON"} {
+				switch v := loose[key].(type) {
+				case string:
+					if v != "" {
+						storage = []byte(v)
+					}
+				case []byte:
+					storage = v
+				}
+			}
+		}
+	}
+	if len(storage) == 0 {
+		// No auth material → no models (disabled / missing credential).
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: nil})
+	}
+	sa, err := parseStored(storage)
+	if err != nil {
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: nil})
+	}
+	applyHostCredentialFields(sa, meta, nil)
+	if sa.Disabled {
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: nil})
+	}
+	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: wbModels()})
 }
 
 func handleStartLogin(raw []byte) ([]byte, error) {
@@ -1309,11 +1561,12 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
-	// Preserve host panel fields (prefix / proxy_url / priority) across refresh.
+	// Preserve host panel fields (prefix/proxy/priority/disabled/aliases/exclusions).
 	applyHostCredentialFields(sa, req.Metadata, req.Attributes)
 	if p := strings.TrimSpace(req.Attributes["proxy_url"]); p != "" && sa.ProxyURL == "" {
 		sa.ProxyURL = p
 	}
+	// Disabled credentials still refresh storage so re-enable works, but stay Disabled.
 	// API keys do not rotate; return the same credential unchanged.
 	if sa.isAPIKey() {
 		return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa, authFileName)})
@@ -1364,9 +1617,16 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyHostCredentialFields(sa, req.Metadata, nil)
+	if sa.Disabled {
+		return nil, fmt.Errorf("auth_disabled: workbuddy credential is disabled")
+	}
 	// CodeBuddy rejects non-stream requests (code 11101), so always stream
 	// upstream and fold the chunks into a single chat.completion object.
 	body := rewriteSystemForUpstream(forceStreamBody(req.Payload, req.OriginalRequest))
+	if err := ensureModelAllowed(body, sa); err != nil {
+		return nil, err
+	}
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -1405,11 +1665,18 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	applyHostCredentialFields(sa, req.Metadata, nil)
+	if sa.Disabled {
+		return nil, fmt.Errorf("auth_disabled: workbuddy credential is disabled")
+	}
 	body := req.Payload
 	if len(body) == 0 {
 		body = req.OriginalRequest
 	}
 	body = rewriteSystemForUpstream(body)
+	if err := ensureModelAllowed(body, sa); err != nil {
+		return nil, err
+	}
 
 	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
@@ -1704,6 +1971,39 @@ func forceMaxThinking(obj map[string]any) bool {
 	return true
 }
 
+// ensureModelAllowed rejects requests for models listed in the credential's
+// excluded_models (defense in depth; CPA host also filters the model registry).
+func ensureModelAllowed(payload []byte, sa *storedAuth) error {
+	if sa == nil || len(sa.ExcludedModels) == 0 || len(payload) == 0 {
+		return nil
+	}
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return nil
+	}
+	model, _ := obj["model"].(string)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return nil
+	}
+	// Strip optional prefix for comparison (prefix/model or prefix-model).
+	bare := model
+	if sa.Prefix != "" {
+		p := sa.Prefix
+		if strings.HasPrefix(bare, p+"/") {
+			bare = strings.TrimPrefix(bare, p+"/")
+		} else if strings.HasPrefix(bare, p+"-") {
+			bare = strings.TrimPrefix(bare, p+"-")
+		}
+	}
+	for _, ex := range sa.ExcludedModels {
+		if strings.EqualFold(model, ex) || strings.EqualFold(bare, ex) {
+			return fmt.Errorf("model_excluded: %s is excluded on this workbuddy credential", model)
+		}
+	}
+	return nil
+}
+
 // aggregateCompletion folds an SSE stream into a single non-streaming
 // chat.completion object (used for non-stream client requests).
 func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
@@ -1910,15 +2210,18 @@ func managementHTMLResponse() managementHandleResponse {
 
 func handleSaveAPIKey(body []byte) ([]byte, error) {
 	var payload struct {
-		APIKey       string  `json:"api_key"`
-		APIKeyCamel  string  `json:"apiKey"`
-		Key          string  `json:"key"`
-		UserID       string  `json:"user_id"`
-		Domain       string  `json:"domain"`
-		EnterpriseID string  `json:"enterprise_id"`
-		Prefix       string  `json:"prefix"`
-		ProxyURL     string  `json:"proxy_url"`
-		Priority     flexInt `json:"priority"`
+		APIKey         string       `json:"api_key"`
+		APIKeyCamel    string       `json:"apiKey"`
+		Key            string       `json:"key"`
+		UserID         string       `json:"user_id"`
+		Domain         string       `json:"domain"`
+		EnterpriseID   string       `json:"enterprise_id"`
+		Prefix         string       `json:"prefix"`
+		ProxyURL       string       `json:"proxy_url"`
+		Priority       flexInt      `json:"priority"`
+		Disabled       bool         `json:"disabled"`
+		ExcludedModels []string     `json:"excluded_models"`
+		ModelAliases   []modelAlias `json:"model_aliases"`
 	}
 	// Allow raw text body as the key itself.
 	trimmed := strings.TrimSpace(string(body))
@@ -1940,15 +2243,18 @@ func handleSaveAPIKey(body []byte) ([]byte, error) {
 		})
 	}
 	sa := &storedAuth{
-		Type:         providerName,
-		AuthType:     authTypeAPIKey,
-		APIKey:       key,
-		UserID:       firstNonEmpty(strings.TrimSpace(payload.UserID), "anonymous"),
-		Domain:       firstNonEmpty(strings.TrimSpace(payload.Domain), "copilot.tencent.com"),
-		EnterpriseID: strings.TrimSpace(payload.EnterpriseID),
-		Prefix:       payload.Prefix,
-		ProxyURL:     payload.ProxyURL,
-		Priority:     payload.Priority,
+		Type:           providerName,
+		AuthType:       authTypeAPIKey,
+		APIKey:         key,
+		UserID:         firstNonEmpty(strings.TrimSpace(payload.UserID), "anonymous"),
+		Domain:         firstNonEmpty(strings.TrimSpace(payload.Domain), "copilot.tencent.com"),
+		EnterpriseID:   strings.TrimSpace(payload.EnterpriseID),
+		Prefix:         payload.Prefix,
+		ProxyURL:       payload.ProxyURL,
+		Priority:       payload.Priority,
+		Disabled:       payload.Disabled,
+		ExcludedModels: payload.ExcludedModels,
+		ModelAliases:   payload.ModelAliases,
 	}
 	normalizeStored(sa)
 	fileName := sa.authID() + ".json"
@@ -1976,14 +2282,17 @@ func handleSaveAPIKey(body []byte) ([]byte, error) {
 		})
 	}
 	out, _ := json.Marshal(map[string]any{
-		"status":    "ok",
-		"provider":  providerName,
-		"fileName":  fileName,
-		"id":        sa.authID(),
-		"label":     sa.label(),
-		"prefix":    sa.Prefix,
-		"proxy_url": sa.ProxyURL,
-		"priority":  sa.Priority.Int(),
+		"status":          "ok",
+		"provider":        providerName,
+		"fileName":        fileName,
+		"id":              sa.authID(),
+		"label":           sa.label(),
+		"prefix":          sa.Prefix,
+		"proxy_url":       sa.ProxyURL,
+		"priority":        sa.Priority.Int(),
+		"disabled":        sa.Disabled,
+		"excluded_models": sa.ExcludedModels,
+		"model_aliases":   sa.ModelAliases,
 	})
 	return okEnvelope(managementHandleResponse{
 		StatusCode: 200,
@@ -1996,32 +2305,112 @@ func handleSaveAPIKey(body []byte) ([]byte, error) {
 // (management menu: "WorkBuddy API Key"). Uses same-origin fetch with the
 // management token from the parent management UI when available.
 const apiKeyPageHTML = `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>WorkBuddy API Key</title>
-  <style>
-    :root { font-family: system-ui, sans-serif; color: #111; background: #f4f4f5; }
-    body { max-width: 560px; margin: 32px auto; padding: 0 16px; }
-    .card { background: #fff; border: 1px solid #e4e4e7; border-radius: 10px; padding: 20px; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
-    h1 { font-size: 18px; margin: 0 0 8px; }
-    p, li { font-size: 13px; color: #52525b; line-height: 1.5; }
-    label { display: block; font-size: 12px; font-weight: 600; margin: 14px 0 6px; }
-    input, textarea { width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #d4d4d8; border-radius: 6px; font: inherit; }
-    textarea { min-height: 88px; font-family: ui-monospace, monospace; font-size: 12px; }
-    button { margin-top: 14px; padding: 10px 16px; border: 0; border-radius: 6px; background: #111; color: #fff; font-weight: 600; cursor: pointer; }
-    button:disabled { opacity: .5; cursor: not-allowed; }
-    .ok { color: #15803d; } .err { color: #b91c1c; }
-    pre { background: #f4f4f5; padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; }
-    code { background: #f4f4f5; padding: 1px 4px; border-radius: 3px; }
-  </style>
-</head>
+	<html lang="zh-CN">
+	<head>
+	  <meta charset="utf-8" />
+	  <meta name="viewport" content="width=device-width, initial-scale=1" />
+	  <meta name="color-scheme" content="light dark" />
+	  <title>WorkBuddy API Key</title>
+	  <style>
+	    :root {
+	      color-scheme: light dark;
+	      font-family: system-ui, sans-serif;
+	      --bg: #f4f4f5;
+	      --card: #fff;
+	      --border: #e4e4e7;
+	      --text: #111;
+	      --muted: #52525b;
+	      --input-bg: #fff;
+	      --input-border: #d4d4d8;
+	      --code-bg: #f4f4f5;
+	      --btn-bg: #111;
+	      --btn-fg: #fff;
+	      --ok: #15803d;
+	      --err: #b91c1c;
+	      --shadow: 0 1px 2px rgba(0,0,0,.04);
+	    }
+	    @media (prefers-color-scheme: dark) {
+	      :root {
+	        --bg: #09090b;
+	        --card: #18181b;
+	        --border: #27272a;
+	        --text: #fafafa;
+	        --muted: #a1a1aa;
+	        --input-bg: #09090b;
+	        --input-border: #3f3f46;
+	        --code-bg: #27272a;
+	        --btn-bg: #fafafa;
+	        --btn-fg: #09090b;
+	        --ok: #4ade80;
+	        --err: #f87171;
+	        --shadow: 0 1px 2px rgba(0,0,0,.4);
+	      }
+	    }
+	    html[data-theme="dark"] {
+	      --bg: #09090b;
+	      --card: #18181b;
+	      --border: #27272a;
+	      --text: #fafafa;
+	      --muted: #a1a1aa;
+	      --input-bg: #09090b;
+	      --input-border: #3f3f46;
+	      --code-bg: #27272a;
+	      --btn-bg: #fafafa;
+	      --btn-fg: #09090b;
+	      --ok: #4ade80;
+	      --err: #f87171;
+	      --shadow: 0 1px 2px rgba(0,0,0,.4);
+	    }
+	    html[data-theme="light"] {
+	      --bg: #f4f4f5;
+	      --card: #fff;
+	      --border: #e4e4e7;
+	      --text: #111;
+	      --muted: #52525b;
+	      --input-bg: #fff;
+	      --input-border: #d4d4d8;
+	      --code-bg: #f4f4f5;
+	      --btn-bg: #111;
+	      --btn-fg: #fff;
+	      --ok: #15803d;
+	      --err: #b91c1c;
+	      --shadow: 0 1px 2px rgba(0,0,0,.04);
+	    }
+	    body { max-width: 560px; margin: 32px auto; padding: 0 16px; background: var(--bg); color: var(--text); }
+	    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; box-shadow: var(--shadow); }
+	    h1 { font-size: 18px; margin: 0 0 8px; color: var(--text); }
+	    p, li { font-size: 13px; color: var(--muted); line-height: 1.5; }
+	    label { display: block; font-size: 12px; font-weight: 600; margin: 14px 0 6px; color: var(--muted); }
+	    input, textarea {
+	      width: 100%; box-sizing: border-box; padding: 10px;
+	      border: 1px solid var(--input-border); border-radius: 6px; font: inherit;
+	      background: var(--input-bg); color: var(--text);
+	    }
+	    input::placeholder, textarea::placeholder { color: var(--muted); opacity: .8; }
+	    textarea { min-height: 88px; font-family: ui-monospace, monospace; font-size: 12px; }
+	    button {
+	      margin-top: 14px; padding: 10px 16px; border: 0; border-radius: 6px;
+	      background: var(--btn-bg); color: var(--btn-fg); font-weight: 600; cursor: pointer;
+	    }
+	    button:disabled { opacity: .5; cursor: not-allowed; }
+	    button.secondary {
+	      margin-left: 8px; background: transparent; color: var(--text);
+	      border: 1px solid var(--input-border);
+	    }
+	    .ok { color: var(--ok); } .err { color: var(--err); }
+	    pre { background: var(--code-bg); color: var(--text); padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; border: 1px solid var(--border); }
+	    code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; color: var(--text); }
+	    .toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+	  </style>
+	</head>
 <body>
+  <div class="toolbar">
+    <button type="button" class="secondary" id="themeBtn" onclick="toggleTheme()">深色/浅色</button>
+  </div>
   <div class="card">
     <h1>WorkBuddy · 添加 CodeBuddy API Key</h1>
     <p>不要把 API Key 填进 OAuth「回调 URL / 授权码」框——CPA 宿主会校验 <code>state</code>，插件收不到粘贴内容。</p>
-    <p>请在此提交，或用下方 curl / Auth Files 上传 JSON。</p>
+    <p>禁用凭据、模型别名、排除模型请用 CPA 标准字段（本页可填，或面板 PATCH / auth JSON）。禁用后该凭据不再注册模型。</p>
     <label>Management Token（与 CPA 管理面板相同）</label>
     <input id="token" placeholder="Bearer token / management key" autocomplete="off" />
 	    <label>CodeBuddy API Key</label>
@@ -2034,30 +2423,51 @@ const apiKeyPageHTML = `<!doctype html>
 	    <input id="proxy" placeholder="http://127.0.0.1:7890" />
 	    <label>priority（可选，调度优先级，整数）</label>
 	    <input id="priority" type="number" placeholder="0" />
+	    <label>excluded_models（可选，逗号分隔，对该凭据隐藏的上游模型 id）</label>
+	    <input id="excluded" placeholder="hy3,minimax-m3-pay" />
+	    <label>model_aliases JSON（可选，CPA 模型别名）</label>
+	    <textarea id="aliases" placeholder='[{"name":"hy3-preview-agent","alias":"hy3"}]' style="min-height:64px"></textarea>
+	    <label style="display:flex;align-items:center;gap:8px;text-transform:none;font-weight:500">
+	      <input id="disabled" type="checkbox" style="width:auto" /> 创建后立即禁用（disabled）
+	    </label>
 	    <button id="btn" onclick="saveKey()">保存</button>
 	    <p id="msg"></p>
 	    <pre id="out" hidden></pre>
 	  </div>
-	  <script>
-	    (function(){
-	      const params = new URLSearchParams(location.search);
-	      const fromQuery = params.get('token') || params.get('management_key') || '';
-	      let fromParent = '';
-	      try {
-	        fromParent = localStorage.getItem('management_key')
-	          || localStorage.getItem('cpa_management_key')
-	          || localStorage.getItem('cliproxy_management_key')
-	          || '';
-	      } catch (e) {}
-	      if (fromQuery || fromParent) document.getElementById('token').value = fromQuery || fromParent;
-	    })();
-	    async function saveKey(){
+		  <script>
+		    (function(){
+		      const params = new URLSearchParams(location.search);
+		      const fromQuery = params.get('token') || params.get('management_key') || '';
+		      let fromParent = '';
+		      try {
+		        fromParent = localStorage.getItem('management_key')
+		          || localStorage.getItem('cpa_management_key')
+		          || localStorage.getItem('cliproxy_management_key')
+		          || '';
+		      } catch (e) {}
+		      if (fromQuery || fromParent) document.getElementById('token').value = fromQuery || fromParent;
+		      try {
+		        const saved = localStorage.getItem('wb_theme');
+		        if (saved === 'dark' || saved === 'light') document.documentElement.setAttribute('data-theme', saved);
+		      } catch (e) {}
+		    })();
+		    function toggleTheme(){
+		      const cur = document.documentElement.getAttribute('data-theme');
+		      const next = cur === 'dark' ? 'light' : (cur === 'light' ? 'dark' :
+		        (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'light' : 'dark'));
+		      document.documentElement.setAttribute('data-theme', next);
+		      try { localStorage.setItem('wb_theme', next); } catch (e) {}
+		    }
+		    async function saveKey(){
 	      const token = document.getElementById('token').value.trim();
 	      const api_key = document.getElementById('key').value.trim();
 	      const user_id = document.getElementById('uid').value.trim() || 'anonymous';
 	      const prefix = document.getElementById('prefix').value.trim();
 	      const proxy_url = document.getElementById('proxy').value.trim();
 	      const priorityRaw = document.getElementById('priority').value.trim();
+	      const excludedRaw = document.getElementById('excluded').value.trim();
+	      const aliasesRaw = document.getElementById('aliases').value.trim();
+	      const disabled = document.getElementById('disabled').checked;
 	      const msg = document.getElementById('msg');
 	      const out = document.getElementById('out');
 	      msg.textContent = ''; out.hidden = true;
@@ -2067,6 +2477,12 @@ const apiKeyPageHTML = `<!doctype html>
 	      if (prefix) body.prefix = prefix;
 	      if (proxy_url) body.proxy_url = proxy_url;
 	      if (priorityRaw !== '') body.priority = Number(priorityRaw);
+	      if (excludedRaw) body.excluded_models = excludedRaw.split(/[,\n]/).map(s => s.trim()).filter(Boolean);
+	      if (aliasesRaw) {
+	        try { body.model_aliases = JSON.parse(aliasesRaw); }
+	        catch (e) { msg.innerHTML = '<span class="err">model_aliases 不是合法 JSON</span>'; return; }
+	      }
+	      if (disabled) body.disabled = true;
 	      const btn = document.getElementById('btn');
 	      btn.disabled = true;
 	      try {

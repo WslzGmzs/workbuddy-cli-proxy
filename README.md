@@ -163,8 +163,54 @@ curl -X POST 'https://<cpa-host>/v0/management/workbuddy/api-key' \
 | `prefix` | 模型前缀（单段，无 `/`）→ `AuthData.Prefix` |
 | `proxy_url` | 该凭据出站 HTTP 代理 → `AuthData.ProxyURL`，插件请求会走此代理 |
 | `priority` | 调度优先级（int / 数字字符串）→ `Attributes["priority"]` + metadata |
+| `disabled` | `true` 时 CPA **注销该凭据的模型绑定**，插件 execute 也拒绝 |
+| `excluded_models` / `excluded-models` | 对该凭据隐藏的上游模型 id 列表（与 `oauth-excluded-models` 同类） |
+| `model_aliases` / `model-aliases` | CPA OAuth 模型别名：`[{"name":"上游id","alias":"客户端名","force-mapping":false}]` |
 
-OAuth 扫码结果默认不带这三项；可在 CPA 面板 PATCH 凭据，或直接编辑 auth 文件后重新加载。Refresh 时会从 host metadata/attributes **保留**已设置的值。
+OAuth 扫码结果默认不带这些；可在 CPA 面板 PATCH 凭据，或直接编辑 auth 文件后重新加载。Refresh 时会从 host metadata/attributes **保留**已设置的值。
+
+#### 为何「禁用了还能拉模型」？
+
+旧版 workbuddy 用 **`model.static` + ExecutorModelScopeBoth`**，模型挂在 **插件静态表** 上，不跟单条凭据走。CPA 禁用凭据时只 `UnregisterClient(auth.ID)`，**静态插件模型仍在**。
+
+现已改为：
+
+- `ExecutorModelScope = oauth`（仅凭据绑定模型）
+- `model.static` 返回空列表
+- `model.for_auth` 在凭据 `disabled` 时返回空；有活跃凭据时返回模型列表
+
+因此：**所有 workbuddy 凭据都禁用 / 无凭据 → `/v1/models` 不应再出现 workbuddy 模型**；至少一条启用凭据 → 正常列出。
+
+#### 模型别名 / 排除（可用 CPA 能力）
+
+1. **全局**（`config.yaml`，CPA 原生）：
+
+```yaml
+oauth-model-alias:
+  workbuddy:
+    - name: hy3-preview-agent   # 上游真实 id
+      alias: hy3                # 客户端请求名
+      force-mapping: false
+oauth-excluded-models:
+  workbuddy:
+    - minimax-m3-pay
+```
+
+2. **单凭据**（auth JSON / 管理页 / 面板字段）：
+
+```json
+{
+  "type": "workbuddy",
+  "auth_type": "api_key",
+  "api_key": "...",
+  "excluded_models": ["minimax-m3-pay"],
+  "model_aliases": [
+    {"name": "hy3-preview-agent", "alias": "hy3", "force-mapping": false}
+  ]
+}
+```
+
+插件会把这些写进 `Metadata` + `Attributes`，供 CPA 注册模型与路由时使用；execute 侧对 `excluded_models` 再做一次拒绝。
 
 ## 使用
 

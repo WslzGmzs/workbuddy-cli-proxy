@@ -71,8 +71,15 @@ CPA standard root fields (must round-trip via `toAuthData`):
 - `prefix` → `AuthData.Prefix` + metadata
 - `proxy_url` → `AuthData.ProxyURL` + metadata; `httpClientForAuth` uses it
 - `priority` → metadata + `Attributes["priority"]` (omit attribute when 0)
+- `disabled` → `AuthData.Disabled` + metadata; `model.for_auth` empty; execute rejects
+- `excluded_models` / `excluded-models` → metadata + `Attributes["excluded_models"]`
+- `model_aliases` / `model-aliases` → metadata + `Attributes["model_aliases"]` (JSON)
+
+Models are **auth-bound only** (`ExecutorModelScopeOAuth`): `model.static` is empty; listing comes from `model.for_auth` so CPA can unregister models when the credential is disabled.
 
 Refresh merges host `Metadata`/`Attributes` when storage omitted the fields (`applyHostCredentialFields`).
+
+API key management page (`/v0/resource/plugins/workbuddy/api-key`) supports light/dark (`prefers-color-scheme` + manual toggle).
 ## Gotchas (do not “simplify” away)
 
 1. **Claude Code blocklist** — `sanitizeBlockedTemplates` (`CLI`→`CLI tool`, `Main branch`→`Default branch`).
